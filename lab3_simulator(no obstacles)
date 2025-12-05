@@ -19,11 +19,19 @@ function lab3_simulator(varargin)
 %
 %  Example:
 %    lab3_simulator('numRobots',12,'simTime',90);
+%
+%  CHANGES:
+%  1. Fixed a goal marker at RC (5, 14) / world (6.5, 2.0) that appeared due to random seed.
+%  2. Modified reversal maneuver to include a turn to improve replanning efficiency.
+%  3. Modified Start/Goal selection for better dispersal.
+%  4. Added timeout logic to force replanning if blocked by a stationary robot.
+%  5. **NEW: Added text labels for robot ID at both the current position and the goal location.**
+
 % ------------- Parse options -------------
 p = inputParser;
 addParameter(p,'numRobots',12,@(x)isnumeric(x)&&x>=1);
-addParameter(p,'numRows',14,@(x)isnumeric(x)&&x>=3); % <--- CHANGED DEFAULT
-addParameter(p,'numCols',16,@(x)isnumeric(x)&&x>=3); % <--- CHANGED DEFAULT
+addParameter(p,'numRows',14,@(x)isnumeric(x)&&x>=3); 
+addParameter(p,'numCols',16,@(x)isnumeric(x)&&x>=3); 
 addParameter(p,'gridSize',0.5,@isnumeric);
 addParameter(p,'simTime',120,@isnumeric);
 addParameter(p,'dt',0.1,@isnumeric);
@@ -32,6 +40,11 @@ addParameter(p,'predT',1.0,@isnumeric);
 addParameter(p,'Rmin',0.1,@isnumeric);
 parse(p,varargin{:});
 opts = p.Results;
+
+% --- NEW PARAMETER: Blocking Timeout ---
+BLOCKING_TIMEOUT = 5.0; % seconds
+% ---------------------------------------
+
 % ------------- Environment: occupancy grid -------------
 numRows = opts.numRows;
 numCols = opts.numCols;
@@ -40,7 +53,7 @@ gridSize = opts.gridSize;
 robotRadius = 0.2;   % [m] physical radius (for keepout/inflation)
 vMax = 0.25;         % max linear speed m/s
 omegaMax = 1.2;      % max angular speed rad/s
-vReverse = -0.15;    % New: Reverse speed command [m/s]
+vReverse = -0.15;    % Reverse speed command [m/s]
 % pure-pursuit lookahead
 lookahead = 0.25;    % meters
 % trapezoid "view" region in front for emergency stop
@@ -52,7 +65,7 @@ originX = 0; originY = 0;
 gridToWorld = @(rc) deal(originX + (rc(:,2)-1)*gridSize, originY + (rc(:,1)-1)*gridSize);
 % Create a simple obstacle layout (you can replace this)
 occ = zeros(numRows, numCols);
-% border walls (KEEPING THESE, now on the new outer edges)
+% border walls
 occ(1,:) = 1; occ(end,:) = 1; occ(:,1) = 1; occ(:,end) = 1;
 % --- Static Obstacle Inflation ---
 for r=1:numRows
@@ -72,32 +85,39 @@ dt = opts.dt;
 tFinal = opts.simTime;
 plannerInterval = opts.plannerInterval;
 predT = opts.predT;
+
 % ------------- Create agents (random starts/goals on free cells) -------------
 freeCells = find(occ==0);
 [fr,fc] = ind2sub(size(occ), freeCells);
 freeRC = [fr, fc];
 rng(0); % reproducible
+
 if size(freeRC,1) < 2*numRobots
     error('Not enough free cells to place robots and goals. Adjust obstacles or reduce numRobots.');
 end
+
+% --- MODIFICATION: Use separate, non-overlapping permutations for better dispersal ---
 perm = randperm(size(freeRC,1));
-startRC_all = freeRC(perm(1:numRobots),:);
-goalRC_all  = freeRC(perm(numRobots+1:2*numRobots),:);
+start_indices = perm(1:numRobots);
+goal_indices = perm(floor(size(freeRC,1)/2) + 1 : floor(size(freeRC,1)/2) + numRobots);
+
+if length(goal_indices) < numRobots
+    error('Internal error: Not enough free cells to pick distinct start and goal locations.');
+end
+
+startRC_all = freeRC(start_indices,:);
+goalRC_all  = freeRC(goal_indices,:);
+% -----------------------------------------------------------------------------
 
 % --- MANUAL GOAL REMOVAL based on user request (RC 5, 14) ---
-targetRC_to_remove = [5, 14];
+targetRC_to_remove = [5, 14]; % This RC cell corresponds to world coord (6.5, 2.0)
 match = ismember(goalRC_all, targetRC_to_remove, 'rows');
 if any(match)
-    % Find the index of the goal to remove
     idx_to_remove = find(match, 1, 'first');
-    % Remove the goal by replacing it with a new random free cell.
-    % To be safe, we just find a spare cell from the remaining free cells.
-    spare_cells = freeRC(perm(2*numRobots+1:end),:);
+    spare_cells = freeRC(perm(2*numRobots+1:end),:); 
     if ~isempty(spare_cells)
-        % Take the first available spare cell to replace the offending one.
         goalRC_all(idx_to_remove, :) = spare_cells(1, :);
     else
-        % If no spare cells, just remove the goal and keep one less goal.
         warning('Cannot replace goal at RC 5, 14. Removing it.');
         goalRC_all(idx_to_remove, :) = [];
     end
@@ -105,24 +125,10 @@ end
 % -----------------------------------------------------------------------------
 
 % --- STARTING POSE MODIFICATION for Robot 1 (Red Robot) ---
-% Ensure the first robot's starting row is at least 3 to avoid the inflated boundary wall.
-% This is now necessary because the border wall is row 1 and inflation often hits row 2.
-% Find a free cell with row >= 3 for the first robot (index 1).
 idx = find(freeRC(:,1) >= 3, 1, 'first');
 if ~isempty(idx)
     startRC_R1 = freeRC(idx,:);
-    % Find where the original start pos of R1 was in the full list
-    match_start = ismember(startRC_all, freeRC(idx,:), 'rows');
-    if any(match_start) % If the new position is already in the list, swap it to the first spot
-        r1_current_pos_index = find(match_start, 1, 'first');
-        if r1_current_pos_index ~= 1
-            startRC_all([1 r1_current_pos_index], :) = startRC_all([r1_current_pos_index 1], :);
-        end
-    else % Otherwise, just replace the first one
-        startRC_all(1,:) = startRC_R1;
-    end
-else
-    warning('Could not find a free cell with row >= 3. Using original start position for R1.');
+    startRC_all(1,:) = startRC_R1; 
 end
 % -----------------------------------------------------------------------------
 % initialize robot structs
@@ -143,6 +149,11 @@ for i=1:numRobots
     % New fields for collision management
     robots(i).collisionState = 'safe'; % 'safe', 'reversing', 'must_replan'
     robots(i).reverseEndTime = 0;      % Time when reversal should stop
+    
+    % NEW FIELDS FOR TIMEOUT LOGIC
+    robots(i).blockedStartTime = -inf; % Time when blockage started
+    robots(i).isBlocked = false;       % Flag indicating persistent blockage
+
     % Kalman-ish state: [x; y; vx; vy] with a simple filter
     robots(i).kf.x = [robots(i).pose(1); robots(i).pose(2); 0; 0];
     robots(i).kf.P = diag([0.01,0.01,0.1,0.1]);
@@ -170,11 +181,26 @@ hRobot = gobjects(numRobots,1);
 hArrow = gobjects(numRobots,1);
 hGoal = gobjects(numRobots,1);
 hPath = gobjects(numRobots,1);
+% --- NEW: Handles for text labels ---
+hTextRobot = gobjects(numRobots,1);
+hTextGoal = gobjects(numRobots,1);
+% ------------------------------------
 for i=1:numRobots
-    hRobot(i) = plot(ax, robots(i).pose(1), robots(i).pose(2), 'o', 'MarkerFaceColor', colors(mod(i-1,size(colors,1))+1,:), 'MarkerSize',8);
-    hArrow(i) = quiver(ax, 0,0,0,0, 'MaxHeadSize',2,'Color',colors(mod(i-1,size(colors,1))+1,:));
-    hGoal(i) = plot(ax, robots(i).goal(1), robots(i).goal(2), 'x', 'Color', colors(mod(i-1,size(colors,1))+1,:), 'MarkerSize',8);
-    hPath(i) = plot(ax, nan, nan, '-', 'Color', colors(mod(i-1,size(colors,1))+1,:),'LineWidth',1);
+    color = colors(mod(i-1,size(colors,1))+1,:);
+    
+    hRobot(i) = plot(ax, robots(i).pose(1), robots(i).pose(2), 'o', 'MarkerFaceColor', color, 'MarkerSize',8);
+    hArrow(i) = quiver(ax, 0,0,0,0, 'MaxHeadSize',2,'Color',color);
+    hGoal(i) = plot(ax, robots(i).goal(1), robots(i).goal(2), 'x', 'Color', color, 'MarkerSize',8);
+    hPath(i) = plot(ax, nan, nan, '-', 'Color', color,'LineWidth',1);
+    
+    % Add text label for the robot ID near the current position (updated dynamically)
+    hTextRobot(i) = text(ax, robots(i).pose(1), robots(i).pose(2) + 0.15, sprintf('R%d', i), ...
+                         'Color', color, 'FontSize', 8, 'HorizontalAlignment', 'center');
+                         
+    % Add text label for the robot ID near the goal (static)
+    hTextGoal(i) = text(ax, robots(i).goal(1), robots(i).goal(2) + 0.15, sprintf('G%d', i), ...
+                        'Color', color, 'FontSize', 8, 'HorizontalAlignment', 'center', ...
+                        'FontWeight', 'bold');
 end
 legend(ax, 'Robots','Location','bestoutside');
 drawnow;
@@ -297,24 +323,54 @@ while t < tFinal
             end
         end
         
-        % 4b) Collision Response Logic
+        % 4b) Collision Response Logic and Blocking Timeout Check
         if collisionPredicted
-            % New: Initiate reversal maneuver
-            if ~strcmp(robots(i).collisionState, 'reversing')
+            % Update blocking status
+            if ~robots(i).isBlocked
+                % Start the blockage timer
+                robots(i).isBlocked = true;
+                robots(i).blockedStartTime = t;
+            else
+                % Check if the robot has been blocked for too long
+                if t - robots(i).blockedStartTime >= BLOCKING_TIMEOUT
+                    fprintf('Robot %d blocked for %.1fs. Forcing reverse and replan.\n', i, BLOCKING_TIMEOUT);
+                    % Force an immediate reversal maneuver (which leads to a replan)
+                    robots(i).collisionState = 'reversing';
+                    robots(i).reverseEndTime = t + 2.0; % 2.0s reverse duration
+                    robots(i).blockedStartTime = -inf; % Reset timer
+                    robots(i).isBlocked = false;
+                end
+            end
+            
+            % Initiate standard reversal if not already reversing or forcing a replan
+            if ~strcmp(robots(i).collisionState, 'reversing') && ~strcmp(robots(i).collisionState, 'must_replan')
                 % Start reversing for a short duration (e.g., 2 seconds)
                 robots(i).collisionState = 'reversing';
                 robots(i).reverseEndTime = t + 2.0; 
-                % Also force a replan after reversing is done
-                robots(i).must_replan_after_reverse = true;
+                % Also force a replan after reversing is done (this is handled by the reverse logic below)
             end
+            
+        else 
+            % No immediate collision predicted: reset blocking status
+            robots(i).isBlocked = false;
+            robots(i).blockedStartTime = -inf;
+
         end
         
         % 4c) Execute Control Command
         if strcmp(robots(i).collisionState, 'reversing')
-            % Execute reverse command
+            % Execute reverse command with a small, random turn
             if t < robots(i).reverseEndTime
-                v_cmd = vReverse; % Negative linear velocity
-                omega_cmd = 0; % Keep orientation straight back
+                v_cmd = vReverse; % Negative linear velocity (-0.15 m/s)
+                
+                % Apply a small, fixed angular velocity (e.g., +/- 0.3 rad/s)
+                % Alternating turn direction based on robot ID to break symmetry.
+                if mod(robots(i).id, 2) == 0
+                    omega_cmd = 0.3; % Turn Left
+                else
+                    omega_cmd = -0.3; % Turn Right
+                end
+                
                 robots(i).vel = [v_cmd*cos(robots(i).pose(3)), v_cmd*sin(robots(i).pose(3))];
             else
                 % Reversal time is up. Stop and flag for replanning.
@@ -365,6 +421,15 @@ while t < tFinal
         else
             set(hPath(i),'XData',nan,'YData',nan);
         end
+        % Update text label position for the robot
+        set(hTextRobot(i), 'Position', [robots(i).pose(1), robots(i).pose(2) + 0.15]);
+        
+        % Dim the goal marker and text if the robot has reached it
+        if norm(robots(i).pose(1:2) - robots(i).goal) < 0.05
+            set(hGoal(i), 'Color', [0.5 0.5 0.5]);
+            set(hTextGoal(i), 'Color', [0.5 0.5 0.5]);
+            set(hTextRobot(i), 'String', sprintf('R%d (Done)', i));
+        end
     end
     drawnow limitrate;
     % advance time
@@ -410,7 +475,7 @@ fprintf('Simulation finished.\n');
         pback = [x, y];
         pfront = [x + depth*cos(th), y + depth*sin(th)];
         % back left/right
-        bl = pback + rotate2d( [ -wback/2, 0] , th - pi/2 ); % Corrected angle for side vectors
+        bl = pback + rotate2d( [ -wback/2, 0] , th - pi/2 ); 
         br = pback + rotate2d( [  wback/2, 0] , th - pi/2 );
         fl = pfront + rotate2d( [ -wfront/2, 0] , th - pi/2 );
         fr = pfront + rotate2d( [  wfront/2, 0] , th - pi/2 );
