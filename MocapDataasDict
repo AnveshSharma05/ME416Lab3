@@ -1,0 +1,46 @@
+brokerAddress = "mqtt://rasticvm.lan";
+
+    RobotPositions = containers.Map('KeyType', 'char', 'ValueType', 'any');
+
+    robotID = "#";
+    topic = "rb/" + robotID;
+
+    % Close MQTT if open
+    try 
+        clear mqttClient
+    catch
+    end
+
+    try 
+       mqttClient = mqttclient(brokerAddress, clientId= 'Anvesh');
+       disp(['Connected to MQTT Broker: ', brokerAddress])
+    catch ME
+        error('MQTT_SETUP:FailedConnect', 'Could not connect to the MQTT broker. Error: %s', ME.message);
+    end
+    
+    subscribe(mqttClient, topic);
+    
+    disp(['Successfully subscribed to: ', topic]);
+    
+    for i = 1:10
+        var = peek(mqttClient);
+        
+        % var.Topic
+        if size(var,1)
+            var.Topic(i)
+            jsondecode(var.Data{i}).pos;
+            RobotPositions(var.Topic(i)) = jsondecode(var.Data{i}).pos
+        end
+        pause(.05)
+    end
+    clear mqttClient
+%%    
+    keyList = keys(RobotPositions);
+    % Process and display the robot positions for easy extractions
+    for k = keyList
+        disp(k{1})
+        disp(RobotPositions(k{1}))
+    end 
+    
+        
+    
