@@ -1,0 +1,732 @@
+function lab3_simulator(varargin)
+% LAB3_SIMULATOR Multi-robot simulator + realtime planning demo for ME416 Lab3
+%
+%  lab3_simulator(...) runs a simulation of multiple limo robots navigating to
+%  random goals on a grid with realtime replanning and simple prediction of
+%  other robots' motion. This function is self-contained and uses local nested
+%  functions to avoid workspace pollution.
+%
+%  Optional name-value arguments:
+%    'numRobots'       - number of robots (default 12)
+%    'numRows'         - grid rows (default 14, was 12)
+%    'numCols'         - grid cols (default 16, was 14)
+%    'gridSize'        - cell size in meters (default 0.5)
+%    'simTime'         - total sim time in seconds (default 180)
+%    'dt'              - control timestep (s) (default 0.1)
+%    'plannerInterval' - replanning interval (s) (default 0.5)
+%    'predT'           - prediction horizon (s) (default 1.0)
+%    'Rmin'            - minimum turning radius for Dubins (used for smoothing) (default 0.1)
+%
+%  Example:
+%    lab3_simulator('numRobots',12,'simTime',90);
+%
+%  CHANGES:
+%  ... (previous changes)
+%  14. **MODIFICATION for User Request**: Destination points are now enforced to be non-adjacent (minimum Manhattan distance of 2 grid units).
+% ------------- Parse options -------------
+p = inputParser;
+addParameter(p,'numRobots',12,@(x)isnumeric(x)&&x>=1);
+addParameter(p,'numRows',14,@(x)isnumeric(x)&&x>=3); 
+addParameter(p,'numCols',16,@(x)isnumeric(x)&&x>=3); 
+addParameter(p,'gridSize',0.5,@isnumeric);
+addParameter(p,'simTime',180,@isnumeric);
+addParameter(p,'dt',0.1,@isnumeric);
+addParameter(p,'plannerInterval',0.5,@isnumeric);
+addParameter(p,'predT',1.0,@isnumeric);
+addParameter(p,'Rmin',0.1,@isnumeric);
+parse(p,varargin{:});
+opts = p.Results;
+% --- NEW PARAMETER: Blocking Timeout ---
+BLOCKING_TIMEOUT = 5.0; % seconds
+% --- NEW PARAMETER: Goal Tolerance (Restored to 0.5 for original control logic) ---
+GOAL_TOLERANCE = 0.5; % meters (NOTE: Reverting to 0.5m for stability, or change to 0.05m if desired)
+% ---------------------------------------
+% ------------- Environment: occupancy grid -------------
+numRows = opts.numRows;
+numCols = opts.numCols;
+gridSize = opts.gridSize;
+% ------------- Robot params (shared) -------------
+robotRadius = 0.2;   % [m] physical radius (for keepout/inflation)
+vMax = 0.25;         % max linear speed m/s
+omegaMax = 1.2;      % max angular speed rad/s
+vReverse = -0.15;    % Reverse speed command [m/s]
+vForwardManeuver = 0.15; % Forward speed command for maneuver [m/s]
+maneuverDuration = 2.0; % Duration of either reverse or forward maneuver [s]
+% pure-pursuit lookahead
+lookahead = 0.25;    % meters
+% trapezoid "view" region in front for emergency stop
+viewDepth = 0.6;     % meters forward depth
+viewWidthFront = 0.5; % width at the front end
+viewWidthBack = 0.15; % width near robot
+% convert grid coordinates to world
+originX = 0; originY = 0;
+gridToWorld = @(rc) deal(originX + (rc(:,2)-1)*gridSize, originY + (rc(:,1)-1)*gridSize);
+% Create a simple obstacle layout (you can replace this)
+occ = zeros(numRows, numCols);
+% --- Static Obstacle Inflation ---
+for r=1:numRows
+    for c=1:numCols
+        if occ(r,c)==1
+            % Re-inflate the map using the circle inflation helper (approximate)
+            [wx, wy] = gridToWorld([r,c]);
+            % Inflate by robotRadius * 1.1 to ensure sufficient clearance
+            occ = inflate_occupancy_with_circle(occ, wx, wy, robotRadius*1.1, gridSize, originX, originY);
+        end
+    end
+end
+% ---------------------------------
+% ------------- Simulation parameters -------------
+numRobots = opts.numRobots;
+dt = opts.dt;
+tFinal = opts.simTime;
+plannerInterval = opts.plannerInterval;
+predT = opts.predT;
+% ------------- Create agents (random starts/goals on free cells) -------------
+freeCells = find(occ==0);
+[fr,fc] = ind2sub(size(occ), freeCells);
+freeRC = [fr, fc];
+rng(1337); % reproducible with fixed seed
+if size(freeRC,1) < 2*numRobots
+    error('Not enough free cells to place robots and goals. Adjust obstacles or reduce numRobots.');
+end
+% --- NEW START LOCATION LOGIC: Robots start on free border cells ---
+r_border = [1:numRows, 1:numRows, ones(1,numCols), numRows*ones(1,numCols)];
+c_border = [ones(1,numRows), numCols*ones(1,numRows), 1:numCols, 1:numCols];
+borderRC = unique([r_border', c_border'], 'rows');
+is_free = false(size(borderRC, 1), 1);
+for k = 1:size(borderRC, 1)
+    r = borderRC(k,1);
+    c = borderRC(k,2);
+    if r >= 1 && r <= numRows && c >= 1 && c <= numCols
+        if occ(r, c) == 0
+            is_free(k) = true;
+        end
+    end
+end
+borderRC_free = borderRC(is_free, :);
+if size(borderRC_free, 1) < numRobots
+    error('Not enough free border cells (%d) to place %d robots.', size(borderRC_free, 1), numRobots);
+end
+perm_border = randperm(size(borderRC_free,1));
+start_indices_border = perm_border(1:numRobots);
+startRC_all = borderRC_free(start_indices_border,:);
+[~, start_indices_in_freeRC] = ismember(startRC_all, freeRC, 'rows');
+remaining_freeRC = freeRC;
+remaining_freeRC(start_indices_in_freeRC, :) = [];
+
+% --- MODIFIED GOAL SELECTION LOGIC: Ensure non-adjacent goals ---
+goalRC_all = zeros(numRobots, 2);
+current_goal_count = 0;
+attempts = 0;
+max_attempts_per_goal = 1000;
+available_goal_indices = 1:size(remaining_freeRC, 1);
+
+while current_goal_count < numRobots && attempts < numRobots * max_attempts_per_goal
+    
+    if isempty(available_goal_indices)
+        warning('Ran out of suitable non-adjacent goal cells before placing all robots.');
+        break;
+    end
+    
+    % Pick a random index from the available pool
+    rand_idx = available_goal_indices(randi(length(available_goal_indices)));
+    candidate_goal = remaining_freeRC(rand_idx, :);
+    
+    is_separated = true;
+    for k = 1:current_goal_count
+        % Check Manhattan distance (L1 norm: abs(dr) + abs(dc))
+        dr = abs(candidate_goal(1) - goalRC_all(k, 1));
+        dc = abs(candidate_goal(2) - goalRC_all(k, 2));
+        
+        % Check if distance is 0 (same cell) or 1 (adjacent)
+        if dr + dc < 2
+            is_separated = false;
+            break;
+        end
+    end
+    
+    if is_separated
+        current_goal_count = current_goal_count + 1;
+        goalRC_all(current_goal_count, :) = candidate_goal;
+        
+        % Remove the selected goal from the pool
+        available_goal_indices(available_goal_indices == rand_idx) = [];
+        
+    else
+        % If not separated, remove the index from the available pool temporarily to avoid thrashing
+        % For simplicity and to avoid too many indices operations, we just let it be re-picked later
+        % but track attempts. For a robust solution, the index should be removed.
+        % Here, we just rely on the attempt count to prevent infinite loops if cells are too sparse.
+        attempts = attempts + 1;
+    end
+end
+
+% Final trim if not all robots received a non-adjacent goal
+goalRC_all = goalRC_all(1:current_goal_count, :);
+numRobots = current_goal_count; % Update numRobots if we failed to place all goals
+if numRobots < opts.numRobots
+    warning('Only placed %d non-adjacent goals out of requested %d.', numRobots, opts.numRobots);
+end
+% -----------------------------------------------------------------------------
+% initialize robot structs
+robots = repmat(struct(), numRobots, 1); % Use actual number of robots
+% numRobots = size(startRC_all, 1); % This line is no longer necessary/correct here
+for i=1:numRobots
+    % Note: startRC_all might have more entries than needed if goal placement failed, 
+    % so we must ensure we only initialize robots for which we have a unique goal.
+    [sx, sy] = gridToWorld(startRC_all(i,:));
+    [gx, gy] = gridToWorld(goalRC_all(i,:));
+    theta0 = rand()*2*pi - pi;
+    robots(i).id = i;
+    robots(i).pose = [sx, sy, theta0];      % [x,y,theta]
+    robots(i).vel = [0, 0];                 % [vx, vy] in world (for simple kalman)
+    robots(i).goal = [gx, gy];
+    robots(i).path = [];   % current planned path in world coords (Nx2)
+    robots(i).pathRC = []; % path as grid RC
+    robots(i).pathIdx = 1; % index along path (world samples)
+    robots(i).lastPlanTime = -inf;
+    % New fields for collision management
+    robots(i).collisionState = 'safe';    % 'safe', 'maneuvering', 'must_replan'
+    robots(i).maneuverEndTime = 0;        % Time when maneuver should stop
+    robots(i).maneuverType = 'reverse';   % 'reverse' or 'forward'
+    robots(i).isDone = false;             % *** NEW: Flag when robot reached goal ***
+    % NEW FIELDS FOR TIMEOUT LOGIC
+    robots(i).blockedStartTime = -inf; % Time when blockage started
+    robots(i).isBlocked = false;       % Flag indicating persistent blockage
+    % Kalman-ish state: [x; y; vx; vy] with a simple filter
+    robots(i).kf.x = [robots(i).pose(1); robots(i).pose(2); 0; 0];
+    robots(i).kf.P = diag([0.01,0.01,0.1,0.1]);
+end
+% ------------- Visualization setup -------------
+fig = figure('Name','Lab3 Multi-robot Sim','NumberTitle','off');
+ax = axes(fig); hold(ax,'on'); axis equal;
+xlim(ax,[0 (numCols-1)*gridSize + gridSize]); ylim(ax,[0 (numRows-1)*gridSize + gridSize]);
+xlabel(ax,'X [m]'); ylabel(ax,'Y [m]');
+title(ax,'Multi-robot realtime planning simulator');
+% draw grid and obstacles
+for r=1:numRows
+    for c=1:numCols
+        xCell = originX + (c-1)*gridSize;
+        yCell = originY + (r-1)*gridSize;
+        if occ(r,c)==1
+            rectangle('Position',[xCell,yCell,gridSize,gridSize],'FaceColor',[0.3 0.3 0.3],'EdgeColor','k');
+        else
+            % Since walls are removed, all boundary cells are now open floor too.
+            rectangle('Position',[xCell,yCell,gridSize,gridSize],'EdgeColor',[0.85 0.85 0.85]);
+        end
+    end
+end
+colors = lines(numRobots);
+hRobot = gobjects(numRobots,1);
+hArrow = gobjects(numRobots,1);
+hGoal = gobjects(numRobots,1);
+hPath = gobjects(numRobots,1);
+% --- NEW: Handles for text labels ---
+hTextRobot = gobjects(numRobots,1);
+hTextGoal = gobjects(numRobots,1);
+% ------------------------------------
+for i=1:numRobots
+    color = colors(mod(i-1,size(colors,1))+1,:);
+    
+    hRobot(i) = plot(ax, robots(i).pose(1), robots(i).pose(2), 'o', 'MarkerFaceColor', color, 'MarkerSize',8);
+    hArrow(i) = quiver(ax, 0,0,0,0, 'MaxHeadSize',2,'Color',color);
+    hGoal(i) = plot(ax, robots(i).goal(1), robots(i).goal(2), 'x', 'Color', color, 'MarkerSize',8);
+    hPath(i) = plot(ax, nan, nan, '-', 'Color', color,'LineWidth',1);
+    
+    % Add text label for the robot ID near the current position (updated dynamically)
+    hTextRobot(i) = text(ax, robots(i).pose(1), robots(i).pose(2) + 0.15, sprintf('R%d', i), ...
+                         'Color', color, 'FontSize', 8, 'HorizontalAlignment', 'center');
+                         
+    % Add text label for the robot ID near the goal (static)
+    hTextGoal(i) = text(ax, robots(i).goal(1), robots(i).goal(2) + 0.15, sprintf('G%d', i), ...
+                        'Color', color, 'FontSize', 8, 'HorizontalAlignment', 'center', ...
+                        'FontWeight', 'bold');
+end
+legend(ax, 'Robots','Location','bestoutside');
+drawnow;
+% *** PAUSE MODIFICATION: Pause for 2 seconds before starting sim ***
+pause(2);
+% ------------- Main sim loop -------------
+t = 0;
+nextPlannerTime = 0;
+while t < tFinal
+    % 1) Read poses (here we use simulator truth, populate predicted filters)
+    for i=1:numRobots
+        % For sim, we propagate the kf state with simple motion model using current pose
+        px = robots(i).pose(1);
+        py = robots(i).pose(2);
+        vx = robots(i).vel(1);
+        vy = robots(i).vel(2);
+        % measurement
+        z = [px; py];
+        % simple KF update (position only)
+        H = [1 0 0 0; 0 1 0 0];
+        Rk = 0.01*eye(2);
+        P = robots(i).kf.P;
+        xpred = robots(i).kf.x; % we'll do predict below
+        S = H*P*H' + Rk;
+        K = P*H'/S;
+        robots(i).kf.x = xpred + K*(z - H*xpred);
+        robots(i).kf.P = (eye(4) - K*H)*P;
+    end
+    % 2) Prediction of other robots (for keepout zones)
+    % Build an occupancy-inflation mask from predicted positions
+    predPositions = zeros(numRobots,2);
+    predVels = zeros(numRobots,2);
+    for i=1:numRobots
+        % simple constant velocity prediction using kf state
+        xkf = robots(i).kf.x;
+        predPositions(i,:) = xkf(1:2)' + (xkf(3:4)' * predT);  % p(t+predT)
+        predVels(i,:) = xkf(3:4)';
+    end
+    
+    % Check which robots need replanning due to emergency maneuvers
+    mustReplan = false(numRobots, 1);
+    for i = 1:numRobots
+        if strcmp(robots(i).collisionState, 'must_replan')
+            mustReplan(i) = true;
+            % Reset state now that replanning is forced
+            robots(i).collisionState = 'safe'; 
+        end
+    end
+    % 3) Replan when needed (every plannerInterval or if path invalid or MUST_REPLAN)
+    if t >= nextPlannerTime - 1e-9 || any(mustReplan)
+        if t >= nextPlannerTime - 1e-9
+            nextPlannerTime = t + plannerInterval;
+        end
+        
+        for i=1:numRobots
+            if mustReplan(i) || t >= robots(i).lastPlanTime + plannerInterval - 1e-9
+                % Check if robot i is currently maneuvering. If so, only replan 
+                % if the maneuver timer has expired (checked in Step 4).
+                if strcmp(robots(i).collisionState, 'maneuvering') && t < robots(i).maneuverEndTime
+                    continue; % skip replanning, continue maneuvering
+                end
+                
+                occ_dyn = occ; % copy base map (already includes static inflation)
+                
+                % mark predicted robots as obstacles (inflate by robot radius + safety margin)
+                for j=1:numRobots
+                    if j==i, continue; end
+                    
+                    % *** NEW: Skip inflation if the robot is done and stationary at its goal ***
+                    if robots(j).isDone
+                        continue; 
+                    end
+                    
+                    px = predPositions(j,1); py = predPositions(j,2);
+                    % Increased static safety margin (0.2 instead of 0.15)
+                    inflateRadius = robotRadius + 0.2 + norm(predVels(j,:))*0.5; % bigger if moving faster
+                    occ_dyn = inflate_occupancy_with_circle(occ_dyn, px, py, inflateRadius, gridSize, originX, originY);
+                end
+                % plan on occupancy map occ_dyn from robot's current grid cell to goal cell
+                % convert robot position to nearest grid RC
+                rc_start = worldToGridRC(robots(i).pose(1:2), gridSize, originX, originY);
+                rc_goal  = worldToGridRC(robots(i).goal, gridSize, originX, originY);
+                % ensure valid indices/clamp
+                rc_start = clampRC(rc_start, numRows, numCols);
+                rc_goal  = clampRC(rc_goal, numRows, numCols);
+                % run A*
+                pathRC = astar_planner_local(occ_dyn, rc_start, rc_goal);
+                
+                if isempty(pathRC)
+                    % MODIFICATION: If no path is found, randomly choose reverse or forward maneuver
+                    
+                    if ~strcmp(robots(i).collisionState, 'maneuvering')
+                        
+                        % 50/50 chance of going forward or reverse
+                        if rand() < 0.5
+                            maneuver = 'reverse';
+                            fprintf('Robot %d: A* failed. Forcing %.1fs reverse maneuver.\n', i, maneuverDuration);
+                        else
+                            maneuver = 'forward';
+                            fprintf('Robot %d: A* failed. Forcing %.1fs forward maneuver.\n', i, maneuverDuration);
+                        end
+                        
+                        robots(i).collisionState = 'maneuvering';
+                        robots(i).maneuverType = maneuver;
+                        robots(i).maneuverEndTime = t + maneuverDuration; 
+                    end
+                    
+                    % Leave existing path empty to ensure the control loop stops/handles the state.
+                    robots(i).pathRC = [];
+                    robots(i).path = [];
+                    robots(i).pathIdx = 1;
+                else
+                    % Path found: convert to world and simplify path
+                    [wx,wy] = gridPathToWorld_local(pathRC, gridSize, originX, originY);
+                    path = double([wx, wy]);
+                    path = simplify_path_keep_corners(path);
+                    robots(i).pathRC = pathRC;
+                    robots(i).path = path;
+                    robots(i).pathIdx = max(1, find_next_waypoint_index(robots(i).pose(1:2), path));
+                    robots(i).lastPlanTime = t;
+                    
+                    % If a new path is found, reset emergency states immediately.
+                    robots(i).collisionState = 'safe'; 
+                    robots(i).isBlocked = false;
+                    robots(i).blockedStartTime = -inf;
+                    robots(i).maneuverType = 'reverse'; % Reset to default 
+                end
+            end
+        end
+    end
+    % 4) Control step for each robot: check trapezoid view, follow waypoint if safe
+    for i=1:numRobots
+        % check if reached goal
+        if norm(robots(i).pose(1:2) - robots(i).goal) < GOAL_TOLERANCE
+            robots(i).vel = [0,0];
+            robots(i).isDone = true; % *** SET FLAG when done ***
+            continue;
+        end
+        robots(i).isDone = false; % Ensure it's false if it's moving
+        
+        % Check for immediate emergency/reversal
+        collisionPredicted = false;
+        
+        % 4a) Check collision with other robots in the near future (0.2s)
+        predT_stop = 0.2; 
+        for j=1:numRobots
+            if j==i, continue; end
+            
+            % Skip collision check against a stationary/done robot
+            if robots(j).isDone
+                continue;
+            end
+            
+            % compute current trapezoid polygon in world coords
+            trapPoly = trapezoid_in_front(robots(i).pose, viewDepth, viewWidthBack, viewWidthFront);
+            
+            % check predicted position of j at small horizon (0.2 s)
+            xkf_j = robots(j).kf.x;
+            pj = xkf_j(1:2)' + (xkf_j(3:4)' * predT_stop); % p_j(t+0.2s)
+            
+            if inpolygon(pj(1), pj(2), trapPoly(:,1), trapPoly(:,2))
+                collisionPredicted = true;
+                break;
+            end
+        end
+        
+        % 4b) Collision Response Logic and Blocking Timeout Check
+        if collisionPredicted
+            % Update blocking status
+            if ~robots(i).isBlocked
+                % Start the blockage timer
+                robots(i).isBlocked = true;
+                robots(i).blockedStartTime = t;
+            else
+                % Check if the robot has been blocked for too long
+                if t - robots(i).blockedStartTime >= BLOCKING_TIMEOUT
+                    fprintf('Robot %d blocked for %.1fs. Forcing reverse and replan.\n', i, BLOCKING_TIMEOUT);
+                    % Force an immediate reversal maneuver (which leads to a replan)
+                    robots(i).collisionState = 'maneuvering';
+                    robots(i).maneuverType = 'reverse'; % Default to reverse on timeout
+                    robots(i).maneuverEndTime = t + maneuverDuration; 
+                    robots(i).blockedStartTime = -inf; % Reset timer
+                    robots(i).isBlocked = false;
+                end
+            end
+            
+            % Initiate standard reversal if not already maneuvering or forcing a replan
+            if ~strcmp(robots(i).collisionState, 'maneuvering') || strcmp(robots(i).maneuverType, 'forward')
+                % Start or restart reversing for immediate safety
+                robots(i).collisionState = 'maneuvering';
+                robots(i).maneuverType = 'reverse'; % Collision avoidance must always reverse
+                robots(i).maneuverEndTime = t + maneuverDuration; 
+                fprintf('Robot %d: Immediate collision predicted. Forcing REVERSE maneuver.\n', i);
+            end
+            
+        else 
+            % No immediate collision predicted: reset blocking status
+            robots(i).isBlocked = false;
+            robots(i).blockedStartTime = -inf;
+        end
+        
+        % 4c) Execute Control Command
+        if strcmp(robots(i).collisionState, 'maneuvering')
+            % Execute the chosen maneuver (Reverse or Forward)
+            if t < robots(i).maneuverEndTime
+                % Select velocity based on maneuver type
+                if strcmp(robots(i).maneuverType, 'reverse')
+                    v_cmd = vReverse; % Negative linear velocity (-0.15 m/s)
+                else % 'forward' 
+                    v_cmd = vForwardManeuver; % Positive linear velocity (0.15 m/s)
+                end
+                
+                % Apply a small, fixed angular velocity (e.g., +/- 0.3 rad/s)
+                % Alternating turn direction based on robot ID to break symmetry.
+                if mod(robots(i).id, 2) == 0
+                    omega_cmd = 0.3; % Turn Left
+                else
+                    omega_cmd = -0.3; % Turn Right
+                end
+                
+                robots(i).vel = [v_cmd*cos(robots(i).pose(3)), v_cmd*sin(robots(i).pose(3))];
+            else
+                % Maneuver time is up. Stop and flag for replanning.
+                v_cmd = 0;
+                omega_cmd = 0;
+                robots(i).vel = [0,0];
+                robots(i).collisionState = 'must_replan'; % Transition to signal immediate replan
+            end
+            
+        else % 'safe' state (default)
+            % follow path using pure pursuit
+            if isempty(robots(i).path)
+                % no path available: stop
+                v_cmd = 0;
+                omega_cmd = 0;
+                robots(i).vel = [0,0];
+            else
+                % find lookahead point along path
+                idx = robots(i).pathIdx;
+                [lookPt, newIdx] = pure_pursuit_lookahead(robots(i).pose, robots(i).path, idx, lookahead);
+                robots(i).pathIdx = newIdx;
+                % compute control to reach lookPt (non-holonomic)
+                [v_cmd, omega_cmd] = compute_unicycle_to_point(robots(i).pose, lookPt, vMax, omegaMax);
+                % update velocity (for kf state and simple sim)
+                robots(i).vel = [v_cmd*cos(robots(i).pose(3)), v_cmd*sin(robots(i).pose(3))];
+            end
+        end
+        % integrate robot kinematics (unicycle forward Euler)
+        theta = robots(i).pose(3);
+        robots(i).pose(1) = robots(i).pose(1) + v_cmd*cos(theta)*dt;
+        robots(i).pose(2) = robots(i).pose(2) + v_cmd*sin(theta)*dt;
+        robots(i).pose(3) = wrapToPi(robots(i).pose(3) + omega_cmd*dt);
+        % update kf predicted velocity state somewhat
+        robots(i).kf.x(1:2) = robots(i).pose(1:2)';
+        robots(i).kf.x(3:4) = robots(i).vel';
+        % small process noise
+        robots(i).kf.P = robots(i).kf.P + diag([1e-4,1e-4,1e-3,1e-3]);
+    end
+    % 5) update visualization
+    for i=1:numRobots
+        set(hRobot(i),'XData',robots(i).pose(1),'YData',robots(i).pose(2));
+        % arrow
+        dx = 0.25*cos(robots(i).pose(3)); dy = 0.25*sin(robots(i).pose(3));
+        set(hArrow(i),'XData',robots(i).pose(1),'YData',robots(i).pose(2),'UData',dx,'VData',dy);
+        % path
+        if ~isempty(robots(i).path)
+            set(hPath(i),'XData',robots(i).path(:,1),'YData',robots(i).path(:,2));
+        else
+            set(hPath(i),'XData',nan,'YData',nan);
+        end
+        % Update text label position for the robot
+        set(hTextRobot(i), 'Position', [robots(i).pose(1), robots(i).pose(2) + 0.15]);
+        
+        % Dim the goal marker and text if the robot has reached it
+        if robots(i).isDone % Use the new flag
+            set(hGoal(i), 'Color', [0.5 0.5 0.5]);
+            set(hTextGoal(i), 'Color', [0.5 0.5 0.5]);
+            set(hTextRobot(i), 'String', sprintf('R%d (Done)', i));
+        else
+            set(hGoal(i), 'Color', colors(mod(i-1,size(colors,1))+1,:)); % Reset color if somehow undone
+            set(hTextGoal(i), 'Color', colors(mod(i-1,size(colors,1))+1,:));
+            set(hTextRobot(i), 'String', sprintf('R%d', i));
+        end
+    end
+    drawnow limitrate;
+    % advance time
+    t = t + dt;
+end % main loop
+fprintf('Simulation finished.\n');
+%%%%%%%%%%%%%%% Nested helper functions %%%%%%%%%%%%%%%%%
+    function [rc] = worldToGridRC(pt, gs, ox, oy)
+        % pt = [x y] or Nx2
+        x = pt(1); y = pt(2);
+        col = round((x - ox)/gs) + 1;
+        row = round((y - oy)/gs) + 1;
+        rc = [row, col];
+    end
+    function rc = clampRC(rc, nR, nC)
+        rc(1) = min(max(1,rc(1)), nR);
+        rc(2) = min(max(1,rc(2)), nC);
+    end
+    function occ2 = inflate_occupancy_with_circle(occ_in, cx, cy, radius, gs, ox, oy)
+        occ2 = occ_in;
+        % compute bounding RCs
+        minx = cx - radius; maxx = cx + radius;
+        miny = cy - radius; maxy = cy + radius;
+        c1 = floor((minx - ox)/gs) + 1; c2 = ceil((maxx - ox)/gs) + 1;
+        r1 = floor((miny - oy)/gs) + 1; r2 = ceil((maxy - oy)/gs) + 1;
+        % clamp
+        c1 = max(c1,1); r1 = max(r1,1); c2 = min(c2,numCols); r2 = min(r2,numRows);
+        for rr = r1:r2
+            for cc = c1:c2
+                % cell center
+                cxCell = ox + (cc-1)*gs + gs/2; % Use cell center for more accurate distance
+                cyCell = oy + (rr-1)*gs + gs/2;
+                if hypot(cxCell - cx, cyCell - cy) <= radius
+                    occ2(rr,cc) = 1;
+                end
+            end
+        end
+    end
+    function tri = trapezoid_in_front(pose, depth, wback, wfront)
+        % returns 4x2 polygon [x y] of trapezoid in front of robot (clockwise)
+        x = pose(1); y = pose(2); th = pose(3);
+        % back and front centers
+        pback = [x, y];
+        pfront = [x + depth*cos(th), y + depth*sin(th)];
+        % back left/right
+        bl = pback + rotate2d( [ -wback/2, 0] , th - pi/2 ); 
+        br = pback + rotate2d( [  wback/2, 0] , th - pi/2 );
+        fl = pfront + rotate2d( [ -wfront/2, 0] , th - pi/2 );
+        fr = pfront + rotate2d( [  wfront/2, 0] , th - pi/2 );
+        tri = [bl; br; fr; fl];
+    end
+    function v = rotate2d(pt, ang)
+        R = [cos(ang) -sin(ang); sin(ang) cos(ang)];
+        v = (R * pt')';
+    end
+    function [lookPt, newIdx] = pure_pursuit_lookahead(pose, path, idx, Ld)
+        % returns a lookahead point on path at distance >= Ld from current pose.
+        % path: Nx2
+        p = pose(1:2);
+        N = size(path,1);
+        if idx > N, idx = N; end
+        newIdx = idx;
+        % start from idx and walk forward accumulating distance
+        for k = idx:N-1
+            segA = path(k,:);
+            segB = path(k+1,:);
+            % param along segment - find if there is a point >= Ld
+            % compute distance from robot to segB; if >= Ld pick that; else continue
+            if norm(segB - p) >= Ld
+                lookPt = segB;
+                newIdx = k+1;
+                return;
+            end
+        end
+        % if none found, return final point
+        lookPt = path(end,:);
+        newIdx = N;
+    end
+    function idx = find_next_waypoint_index(poseXY, path)
+        % returns index of the first path point that is at least 0.01 m away
+        d = vecnorm((path - poseXY),2,2);
+        idx = find(d > 0.01, 1, 'first');
+        if isempty(idx), idx = size(path,1); end
+    end
+    function [v,omega] = compute_unicycle_to_point(pose, pt, vMaxLocal, omegaMaxLocal)
+        % returns linear and angular velocity (simple P controller)
+        x = pose(1); y = pose(2); th = pose(3);
+        dx = pt(1) - x; dy = pt(2) - y;
+        dist = hypot(dx,dy);
+        desired = atan2(dy,dx);
+        aerr = wrapToPi(desired - th);
+        K_lin = 0.8;
+        K_ang = 2.0;
+        v = K_lin * dist;
+        omega = K_ang * aerr;
+        v = max(min(v, vMaxLocal), -vMaxLocal);
+        omega = max(min(omega, omegaMaxLocal), -omegaMaxLocal);
+        % Softened heading-only stop to allow slow forward movement
+        if abs(aerr) > pi/3
+             v = v * (1 - abs(aerr) / pi); % Scales v down smoothly as aerr approaches pi
+        end
+    end
+    function path = simplify_path_keep_corners(pathIn)
+        % simple simplification: keep start, corners, end (works for straight grid paths)
+        pts = pathIn;
+        if size(pts,1) <= 2
+            path = pts; return;
+        end
+        out = pts(1,:);
+        prev = pts(2,:) - pts(1,:);
+        for ii=2:size(pts,1)-1
+            cur = pts(ii+1,:) - pts(ii,:);
+            % check if direction changed (allowing for floating point errors)
+            if ~all(abs(cur - prev) < 1e-6)
+                out = [out; pts(ii,:)]; %#ok<AGROW>
+                prev = cur;
+            end
+        end
+        out = [out; pts(end,:)];
+        path = out;
+    end
+    function h = heuristic(nodeRC, goalRC)
+        dr = double(goalRC(1)-nodeRC(1));
+        dc = double(goalRC(2)-nodeRC(2));
+        h = sqrt(dr^2 + dc^2);
+    end
+    function pathRC = astar_planner_local(occ_in, startRC, goalRC)
+        % A* on 4-connected grid (returns Nx2 [row col] path or [])
+        [numRowsA, numColsA] = size(occ_in);
+        if startRC(1) < 1 || startRC(1) > numRowsA || startRC(2) < 1 || startRC(2) > numColsA
+            pathRC = []; return;
+        end
+        if goalRC(1) < 1 || goalRC(1) > numRowsA || goalRC(2) < 1 || goalRC(2) > numColsA
+            pathRC = []; return;
+        end
+        if occ_in(startRC(1), startRC(2))==1 || occ_in(goalRC(1), goalRC(2))==1
+            pathRC = []; return;
+        end
+        % closedMask = false(numRowsA,numColsA); % Not needed if checking tentative cost
+        gcost = inf(numRowsA,numColsA);
+        parent = zeros(numRowsA,numColsA,2,'int32');
+        gcost(startRC(1),startRC(2)) = 0;
+        fstart = heuristic(startRC,goalRC);
+        % store open list as linear indices with f scores
+        openList = containers.Map('KeyType','double','ValueType','double');
+        key = sub2ind(size(occ_in), startRC(1), startRC(2));
+        openList(key) = fstart;
+        nbrs = [-1 0; 1 0; 0 -1; 0 1];
+        while ~isempty(openList)
+            % find min f
+            keys = cell2mat(openList.keys);
+            vals = cell2mat(openList.values);
+            [~, idxmin] = min(vals);
+            keymin = keys(idxmin);
+            openList.remove(keymin);
+            [r,c] = ind2sub(size(occ_in), keymin);
+            if r == goalRC(1) && c == goalRC(2)
+                break;
+            end
+            % explore neighbors
+            for kN = 1:4
+                rr = r + nbrs(kN,1);
+                cc = c + nbrs(kN,2);
+                if rr < 1 || rr > numRowsA || cc < 1 || cc > numColsA, continue; end
+                if occ_in(rr,cc)==1, continue; end
+                tentative = gcost(r,c) + 1;
+                if tentative < gcost(rr,cc)
+                    gcost(rr,cc) = tentative;
+                    parent(rr,cc,:) = int32([r c]);
+                    fval = tentative + heuristic([rr cc], goalRC);
+                    k2 = sub2ind(size(occ_in), rr, cc);
+                    openList(k2) = fval;
+                end
+            end
+        end
+        if gcost(goalRC(1),goalRC(2))==inf
+            pathRC = [];
+            return;
+        end
+        % reconstruct path
+        path = goalRC;
+        cur = goalRC;
+        while ~isequal(cur, startRC)
+            p = squeeze(parent(cur(1),cur(2),:)).';
+            path = [p; path]; %#ok<AGROW>
+            cur = p;
+        end
+        pathRC = path;
+    end
+end % lab3_simulator
+function [wx, wy] = gridPathToWorld_local(pathRC, gs, ox, oy)
+    % Converts an Nx2 [row col] grid path to world coordinates.
+    %
+    % pathRC: Nx2 matrix of [row col]
+    % gs    : grid size (meters)
+    % ox, oy: origin offsets
+    %
+    % Returns:
+    %   wx, wy: Nx1 arrays of world coordinates
+    
+    rows = pathRC(:,1);
+    cols = pathRC(:,2);
+    % Use the center of the cell for world coordinates
+    wx = ox + (cols - 1) * gs + gs/2;
+    wy = oy + (rows - 1) * gs + gs/2;
+end
