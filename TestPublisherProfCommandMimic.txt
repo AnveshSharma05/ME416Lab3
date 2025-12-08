@@ -1,0 +1,44 @@
+%Test Publisher to see if I can give robot commands like STOP and GOAL
+
+brokerAddress = "mqtt://rasticvm.lan";
+
+robotID = "799";               % Use '#' to subscribe to all sub-topics under 'rb/'
+topic = "rb/limo" + robotID;
+
+try 
+    clear mqttClient
+catch
+end
+try 
+   % 1. Create client object
+   mqttClient = mqttclient(brokerAddress, ClientId= 'AnveshPub');
+   disp(['Connected to MQTT Broker: ', brokerAddress])
+   
+   % % 2. Subscribe and assign the callback function
+   % subscribe(mqttClient, topic, Callback=@robotMessageHandler);
+   
+   %disp(['Successfully subscribed to: ', topic]);
+   
+catch ME
+    error('MQTT_SETUP:FailedConnect', 'Could not connect to the MQTT broker. Error: %s', ME.message);
+end
+
+topicToPublish = "cmd/limo" + robotID;
+commandMessage = "WAIT";
+%write(mqttClient, topicToPublish, commandMessage);
+
+goaltoPublish = "goal/limo" + robotID; 
+% 1. goalMessage
+matlabStruct.goal = {'x', 'y'};
+%JSON not in Matlab naturally
+jsonString = jsonencode(matlabStruct);
+
+%write(mqttClient, goaltoPublish, jsonString);
+
+
+while true
+    write(mqttClient, topicToPublish, commandMessage);
+write(mqttClient, goaltoPublish, jsonString);
+pause(2)
+end
+

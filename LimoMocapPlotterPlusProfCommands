@@ -1,0 +1,318 @@
+% MATLAB Live Robot Position Plotter (Optimized)
+% This script connects to an MQTT broker, subscribes to robot position
+% updates, and plots the X-Z position of all robots in real-time.
+
+brokerAddress = "mqtt://rasticvm.lan";
+
+% -------------------------------------------------------------------------
+% 🌐 --- Global Variable Declaration ---
+% -------------------------------------------------------------------------
+% Global variables are required to allow the callback function to update the map and plot
+global RobotPositions; 
+global PlotHandle;           % Handle for the scatter plot object (points)
+global RobotLabelsHandle;    % Handle for the text labels (for cleaning up)
+global FigureHandle;         % Handle for the main figure
+global StopFlag;             % Flag for auto-stop control
+global MainCommand;          % Main command to control STOP, WAIT, GO, HALT
+global GOAL;                 % IS JSON JSON JSON DONT FORGET given by MQTT as the final position of robot
+
+% Initialization
+RobotPositions = containers.Map('KeyType', 'char', 'ValueType', 'any');
+robotID = "799";               % Use '#' to subscribe to all sub-topics under 'rb/'
+topic = "rb/#"; %topic for robot positions, other 2 topics are initialized under the subscribe functions
+StopFlag = false;
+
+% -------------------------------------------------------------------------
+% 🎨 --- Plot Initialization ---
+% -------------------------------------------------------------------------
+% Create a figure and axes once at the start
+FigureHandle = figure('Name', 'Live Robot Positions (X-Z Plane)');
+grid on;
+title('Live Robot Positions (X vs Z)');
+xlabel('X Coordinate');
+ylabel('Z Coordinate');
+axis manual; % Prevents MATLAB from auto-scaling axes aggressively
+axis equal; % Ensures correct aspect ratio
+
+% 1. 🔥 CHANGE: Set initial axes limits to an 8x5 grid (X: -4 to 4, Z: -2.5 to 2.5)
+xlim([-4 4]); 
+ylim([-2.5 2.5]);
+
+% 2. 🔥 CHANGE: Set up the CloseRequestFcn to handle manual figure closing
+set(FigureHandle, 'CloseRequestFcn', @figureCloseHandler);
+
+% Initialize the plot handles with empty data. 
+hold on;
+% Initialize a single plot line handle to update scatter points efficiently
+PlotHandle = plot(NaN, NaN, 'o', 'MarkerSize', 8, 'MarkerFaceColor', 'b', 'DisplayName', 'Robot Positions');
+RobotLabelsHandle = gobjects(0); % Initialize label handles as an array of graphics objects
+hold off;
+
+% -------------------------------------------------------------------------
+% 🔗 --- Connection Setup ---
+% -------------------------------------------------------------------------
+try 
+    clear mqttClient
+catch
+end
+try 
+   % 1. Create client object
+   mqttClient = mqttclient(brokerAddress, ClientId= 'Matthew');
+   disp(['Connected to MQTT Broker: ', brokerAddress])
+   
+   % 2. Subscribe and assign the callback function for robot positions
+   subscribe(mqttClient, topic, Callback=@robotMessageHandler);
+   disp(['Successfully subscribed to: ', topic]);
+
+   % 3. Subscribe to read STOP, WAIT, ETC commands and to read GOAL
+   commandsTopic = "cmd/limo" + robotID;
+   subscribe(mqttClient, commandsTopic, Callback=@robotCommandsHandler);
+   
+   % 4. Subscribe to read goal position
+   goalTopic = "goal/limo" + robotID;
+   subscribe(mqttClient, goalTopic, Callback=@robotGoalHandler);
+   
+
+   
+   
+catch ME
+    error('MQTT_SETUP:FailedConnect', 'Could not connect to the MQTT broker. Error: %s', ME.message);
+end
+
+% -------------------------------------------------------------------------
+% ⏳ --- Auto-Stop Timer Setup ---
+% -------------------------------------------------------------------------
+stopTimer = timer;
+stopTimer.StartDelay = 60; % Set timer to 60 seconds
+stopTimer.TimerFcn = @(myTimer, event) setStopFlag(); 
+stopTimer.StopFcn = @(myTimer, event) delete(myTimer); 
+start(stopTimer);
+disp('Asynchronously listening for robot position updates. The plot will update live.');
+disp('The script will automatically stop after 60 seconds, or if the plot window is closed.');
+
+% -------------------------------------------------------------------------
+% 🔄 --- Execution Loop ---
+% -------------------------------------------------------------------------
+while ~StopFlag
+    % pause(0.1) keeps MATLAB responsive and allows the timer and callback functions to execute
+    pause(0.1); 
+end
+
+% Cleanup when the loop exits
+clear mqttClient
+disp('MQTT connection closed. Script terminated.');
+
+% Delete the figure if it still exists (it shouldn't if the close handler was used)
+if isvalid(FigureHandle)
+    delete(FigureHandle);
+end
+
+% --- Final Display (Retained for post-run data check) ---
+keyList = keys(RobotPositions);
+disp('--- Final Aggregated Robot Positions ---');
+for k = keyList
+    disp(['Robot Topic: ', k{1}])
+    disp(['Position: ', mat2str(RobotPositions(k{1}))])
+end 
+
+% -------------------------------------------------------------------------
+% 🛑 --- Stop Flag Functions ---
+% -------------------------------------------------------------------------
+
+% Timer Callback Function
+function setStopFlag()
+    global StopFlag;
+    StopFlag = true;
+    disp('*** 60 seconds elapsed. Setting StopFlag to terminate the script. ***');
+end
+
+% 🔥 NEW FUNCTION: Figure Close Handler
+function figureCloseHandler(src, event)
+    global StopFlag;
+    StopFlag = true;
+    disp('*** Plot window closed. Setting StopFlag to terminate the script. ***');
+    % The actual figure object deletion is delayed until the main loop exits
+    delete(src); 
+end
+
+% -------------------------------------------------------------------------
+% 🤖 --- Message Handling Function --- 📈
+% -------------------------------------------------------------------------
+function robotMessageHandler(topic, data)
+    global RobotPositions;
+    global FigureHandle;
+    global StopFlag; % Check the StopFlag here too to avoid unnecessary work
+
+    % Check if the figure is closed or the script is stopping
+    if ~isvalid(FigureHandle) || StopFlag
+        return;
+    end
+
+    try
+        jsonString = char(data); 
+        decodedData = jsondecode(jsonString);
+        robotPosition = decodedData.pos; 
+        
+        hasChanged = true; 
+        if isKey(RobotPositions, topic)
+            oldPosition = RobotPositions(topic);
+            if isequal(oldPosition, robotPosition)
+                hasChanged = false;
+            end
+        end
+        
+        if hasChanged
+            RobotPositions(topic) = robotPosition;
+            %disp(['[UPDATED] Topic: ', topic, ' | Position: ', mat2str(robotPosition)])
+            updateLivePlot();
+        end
+        
+    catch ME
+        % If figure is invalid, error handling is unnecessary
+        if ~isvalid(FigureHandle)
+            return; 
+        end
+        warning('ROBOT_HANDLER:ProcessingError', 'Failed to process message from topic %s. Error: %s', topic, ME.message);
+    end
+end
+
+% Command Handling Function
+function robotCommandsHandler(topic, data)
+    global MainCommand; 
+    MainCommand = data; % Should be STOP, GO, WAIT, etc
+
+    % disp("command: ")
+    % MainCommand
+end
+
+%Goal Handling Function
+function robotGoalHandler(topic, data)
+    global GOALS; 
+    GOALS = data; %this is a json data structure
+
+    % if GOAL
+    %    goal = jsondecode(GOAL);
+    %    disp("goal: ")
+    %    goal
+    % end
+
+end
+
+% -------------------------------------------------------------------------
+% 🎨 --- Live Plot Update Function (Optimized for Speed and Throttling) ---
+% -------------------------------------------------------------------------
+function updateLivePlot()
+    global RobotPositions;
+    global PlotHandle;
+    global RobotLabelsHandle;
+    global FigureHandle;
+    
+    persistent LastPlotTime 
+    
+    if isempty(LastPlotTime)
+        LastPlotTime = 0;
+    end
+    
+    % Throttle: Only update the plot if at least 0.1 seconds (100ms) has passed
+    plotInterval = 0.1; 
+    currentTime = posixtime(datetime('now'));
+    
+    if (currentTime - LastPlotTime) < plotInterval
+        return; 
+    end
+    
+    LastPlotTime = currentTime;
+
+    % Check if the plot object or figure is still valid before proceeding
+    if ~isvalid(PlotHandle) || ~isvalid(FigureHandle)
+        return;
+    end
+    
+    keyList = keys(RobotPositions);
+    allX = [];
+    allZ = [];
+    robotLabels = {};
+    
+    % A. Collect Data from the Map
+    for k = keyList
+        robotTopic = k{1};
+        robotPositionArray = RobotPositions(robotTopic);
+        
+        if isnumeric(robotPositionArray) && length(robotPositionArray) >= 2
+            currentX = robotPositionArray(1); 
+            if length(robotPositionArray) >= 3
+                 currentZ = robotPositionArray(3); 
+            else
+                 currentZ = 0; 
+            end
+            
+            allX = [allX, currentX];
+            allZ = [allZ, currentZ];
+            
+            labelParts = split(robotTopic, '/');
+            robotLabels{end+1} = labelParts{end};
+        end
+    end
+    
+    % B. Update Plot Data (FASTEST WAY: Use set on existing handle)
+    if ~isempty(allX) 
+        
+        set(PlotHandle, 'XData', allX, 'YData', allZ);
+        
+        % C. Optimized Axes Limits (Only expand if necessary)
+        ax = gca;
+        currentXLim = get(ax, 'XLim');
+        currentYLim = get(ax, 'YLim');
+        
+        % Check if any point is outside the current range
+        needsRecalc = any(allX < currentXLim(1)) || any(allX > currentXLim(2)) || ...
+                      any(allZ < currentYLim(1)) || any(allZ > currentYLim(2));
+
+        if needsRecalc
+            xRange = max(allX) - min(allX);
+            zRange = max(allZ) - min(allZ);
+            
+            xBuffer = max(5, 0.2 * xRange);
+            zBuffer = max(5, 0.2 * zRange);
+            
+            set(ax, 'XLim', [min(allX) - xBuffer, max(allX) + xBuffer]);
+            set(ax, 'YLim', [min(allZ) - zBuffer, max(allZ) + zBuffer]);
+        end
+        
+        % D. Update Text Labels (Delete old ones, create new ones)
+        
+        % 1. Delete all existing labels
+        if ~isempty(RobotLabelsHandle) && all(isvalid(RobotLabelsHandle))
+            delete(RobotLabelsHandle);
+        end
+        RobotLabelsHandle = gobjects(0); % Reset the handle array
+        
+        % 2. Create and store new labels
+        for i = 1:length(allX)
+            h = text(allX(i) + 0.1, allZ(i) + 0.1, robotLabels{i}, ...
+                     'FontSize', 8, 'Color', 'k', 'FontWeight', 'bold');
+            RobotLabelsHandle(end+1) = h;
+        end
+        
+        % E. Force redraw
+        drawnow limitrate; 
+    end
+end
+
+%% Function to read robot commands from MQTT client
+
+function myMessageCallback(topic, data)
+    disp("Message received on topic: " + topic);
+    disp("Data: " + data);
+
+    % Example: Publish a response command to a new topic based on the received message
+    if contains(string(data), "trigger_command")
+        responseTopic = "myhome/status/response";
+        responseMsg = "Command received and processed!";
+        % You would typically pass the mqClient object to this function 
+        % to publish, but for simplicity, we assume mqClient is accessible 
+        % (e.g., via global variable or wrapped in a class).
+        % For a robust implementation, consider passing the client handle.
+        % write(mqClient, responseTopic, responseMsg); 
+    end
+end
