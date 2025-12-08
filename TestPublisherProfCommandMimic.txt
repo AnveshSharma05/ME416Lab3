@@ -1,44 +1,80 @@
-%Test Publisher to see if I can give robot commands like STOP and GOAL
+% MATLAB Cyclic Command Publisher
+% This script connects to an MQTT broker and cycles through sending the
+% commands: WAIT, STOP, GO, and HALT to the robot with ID 780.
 
 brokerAddress = "mqtt://rasticvm.lan";
+robotID = "780";
+topicPrefix = "limo"; % Base prefix for the Limo robot topics
 
-robotID = "799";               % Use '#' to subscribe to all sub-topics under 'rb/'
-topic = "rb/limo" + robotID;
+% --- Command Topics ---
+topicToPublish = "cmd/" + topicPrefix + robotID;
+goaltoPublish = "goal/" + topicPrefix + robotID;
 
+% --- Command and Goal Data Definitions ---
+% List of commands to cycle through
+allCommands = ["WAIT", "STOP", "GO", "HALT"];
+commandIndex = 1; % Start with the first command: "WAIT"
+
+% Goal message definition (JSON payload, required for 'GO' command)
+% NOTE: The actual coordinates for a goal need to be defined here.
+matlabStruct.goal = [1.0, 0.0]; % Example Goal: Go to X=1.0, Y=0.0
+jsonGoalString = jsonencode(matlabStruct);
+
+% --- Connection Setup ---
 try 
     clear mqttClient
 catch
 end
+
 try 
    % 1. Create client object
-   mqttClient = mqttclient(brokerAddress, ClientId= 'AnveshPub');
+   mqttClient = mqttclient(brokerAddress, ClientId= 'AnveshPubCycler');
    disp(['Connected to MQTT Broker: ', brokerAddress])
-   
-   % % 2. Subscribe and assign the callback function
-   % subscribe(mqttClient, topic, Callback=@robotMessageHandler);
-   
-   %disp(['Successfully subscribed to: ', topic]);
+   disp(['Control Topic: ', topicToPublish]);
+   disp(['Goal Topic: ', goaltoPublish]);
+   disp('------------------------------------------');
    
 catch ME
     error('MQTT_SETUP:FailedConnect', 'Could not connect to the MQTT broker. Error: %s', ME.message);
 end
 
-topicToPublish = "cmd/limo" + robotID;
-commandMessage = "WAIT";
-%write(mqttClient, topicToPublish, commandMessage);
+% Execution Loop ---
 
-goaltoPublish = "goal/limo" + robotID; 
-% 1. goalMessage
-matlabStruct.goal = {'x', 'y'};
-%JSON not in Matlab naturally
-jsonString = jsonencode(matlabStruct);
+disp('Starting command cycle (WAIT, STOP, GO, HALT)... Press Ctrl+C to stop.');
 
-%write(mqttClient, goaltoPublish, jsonString);
+try
+    while true
+        % 1. Determine the current command
+        currentCommand = allCommands(commandIndex);
+        
+        % 2. Publish the command message
+        write(mqttClient, topicToPublish, currentCommand);
+        
+        % 3. Check if a Goal needs to be published (usually only for 'GO')
+        if strcmp(currentCommand, "GO")
+            write(mqttClient, goaltoPublish, jsonGoalString);
+            disp(['GO and Goal (', currentCommand, ') | Payload: ', jsonGoalString]);
+        else
+            disp(['Command (', currentCommand, ')']);
+        end
 
-
-while true
-    write(mqttClient, topicToPublish, commandMessage);
-write(mqttClient, goaltoPublish, jsonString);
-pause(2)
+        % 4. Wait for 2 seconds
+        pause(2)
+        
+        % 5. Advance to the next command in the cycle
+        commandIndex = mod(commandIndex, length(allCommands)) + 1; 
+    end
+    
+catch ME
+    % Handle Ctrl+C or other errors cleanly
+    if ~strcmp(ME.identifier, 'MATLAB:keyboard_interrupt')
+        warning('ExecutionError', 'The execution loop terminated unexpectedly. Error: %s', ME.message);
+    end
 end
 
+% --- Cleanup ---
+if exist('mqttClient', 'var') && isvalid(mqttClient)
+    clear mqttClient
+    disp('------------------------------------------');
+    disp('MQTT connection closed. Script terminated.');
+end
