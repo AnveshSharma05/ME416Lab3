@@ -1,0 +1,50 @@
+global MainCommand;
+global GOAL; 
+
+MatthewBlockFunctions();
+
+function MatthewBlockFunctions()
+% Initialize MQTT client connection
+    global MainCommand;
+    global GOAL; 
+
+    ALL_CFG.mqttBroker = 'mqtt://rasticvm.lan';
+    mqttHandle = mqttclient(ALL_CFG.mqttBroker, ClientID='test');
+
+    limoIdNumber = '799';
+
+    getCommand(mqttHandle, limoIdNumber)
+    getGoal(mqttHandle, limoIdNumber)
+    for i=1:10
+        disp(MainCommand)
+        disp(GOAL)
+        pause(1)
+    end
+end
+
+
+
+%% GET KEN COMMAND BLOCK
+function getCommand(mqttClient, robotID)
+    % 3. Subscribe to read STOP, WAIT, ETC commands and to read GOAL
+   commandsTopic = "cmd/limo" + robotID;
+   subscribe(mqttClient, commandsTopic, Callback=@robotCommandsHandler);
+end
+
+function robotCommandsHandler(topic, data)
+    global MainCommand; 
+    MainCommand = data; % Should be STOP, GO, WAIT, etc
+end
+
+%% GET KEN GOAL POINT
+function getGoal(mqttClient, robotID)
+    % 3. Subscribe to read STOP, WAIT, ETC commands and to read GOAL
+   commandsTopic = "goal/limo" + robotID;
+   subscribe(mqttClient, commandsTopic, Callback=@goalHandler);
+end
+
+
+function goalHandler(topic, data)
+    global GOAL; 
+    GOAL = jsondecode(data).goal; % Should be STOP, GO, WAIT, etc
+end
