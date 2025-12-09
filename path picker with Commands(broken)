@@ -1,0 +1,688 @@
+global GOAL;   
+global RobotPositions; 
+global FigureHandle; 
+global StopFlag;    
+global MainCommand;     
+
+function combinedcontroller2()
+% This script uses a combination of Dubins path planning and Pure Pursuit
+% control.
+% Robot position feedback is received via MQTT
+% Control commands are sent via TCP/IP.
+    % Clear workspace and close all figures for a fresh start
+    clearvars; close all;
+
+    % --- LIMO Network Configuration (Hardcoded) ---
+    limoIpSuffix = '173';
+    limoIdNumber = '799';
+    
+    fprintf('\n--- LIMO Network Configuration ---\n');
+    fprintf('IP last 3 digits: %s\n', limoIpSuffix);
+    fprintf('LIMO number: %s\n', limoIdNumber);
+    
+    % Final destination [x; y] - ALL ROUTES GO TO [5.0; 5.0]
+    courseGoal = [5.0; 5.0];
+    
+
+%% ---- Connection Setup ---
+    try 
+        clear mqttClient
+    catch
+    end
+    try 
+       % 1. Create client object
+       mqttClient = mqttclient(brokerAddress, ClientId= 'Matthew');
+       disp(['Connected to MQTT Broker: ', brokerAddress])
+       
+       % 2. Subscribe and assign the callback function for robot positions
+       subscribe(mqttClient, topic, Callback=@robotMessageHandler);
+       disp(['Successfully subscribed to: ', topic]);
+    
+       % 3. Subscribe to read STOP, WAIT, ETC commands and to read GOAL
+       commandsTopic = "cmd/limo" + robotID;
+       subscribe(mqttClient, commandsTopic, Callback=@robotCommandsHandler);
+       
+       % 4. Subscribe to read goal position
+       goalTopic = "goal/limo" + robotID;
+       subscribe(mqttClient, goalTopic, Callback=@robotGoalHandler);
+       
+    
+       
+       
+    catch ME
+        error('MQTT_SETUP:FailedConnect', 'Could not connect to the MQTT broker. Error: %s', ME.message);
+    end
+
+   %----
+
+%%--- Message Handling Function --- 
+function robotMessageHandler(topic, data)
+    global RobotPositions;
+    global FigureHandle;
+    global StopFlag; % Check the StopFlag here too to avoid unnecessary work
+
+    % Check if the figure is closed or the script is stopping
+  %  if ~isvalid(FigureHandle) || StopFlag
+    %    return;
+    %end
+
+    try
+        jsonString = char(data); 
+        decodedData = jsondecode(jsonString);
+        robotPosition = decodedData.pos; 
+        
+        hasChanged = true; 
+        if isKey(RobotPositions, topic)
+            oldPosition = RobotPositions(topic);
+            if isequal(oldPosition, robotPosition)
+                hasChanged = false;
+            end
+        end
+        
+        if hasChanged
+            RobotPositions(topic) = robotPosition;
+            updateLivePlot();
+        end
+        
+    catch ME
+        % If figure is invalid, error handling is unnecessary
+        if ~isvalid(FigureHandle)
+            return; 
+        end
+        warning('ROBOT_HANDLER:ProcessingError', 'Failed to process message from topic %s. Error: %s', topic, ME.message);
+    end
+end
+
+% Command Handling Function
+function robotCommandsHandler(topic, data)
+    global MainCommand; 
+    MainCommand = data; % STOP GO WAIT
+    % disp("command: ")
+    % MainCommand
+end
+
+%Goal Handling Function
+function robotGoalHandler(topic, data)
+    global GOALS; 
+    GOALS = data; %this is a json data structure
+
+
+
+end
+%---
+    %% 1. DEFINE RANDOM OBSTACLES
+    fprintf('\nGenerating 10 random obstacles...\n');
+    numObstacles = 10;
+    obstacleRadius = 0.25; % Radius of each circular obstacle [m]
+    
+    % Generate random coordinates within a box of [0.5, 4.5] x [0.5, 4.5]
+    mapLimits = [0.5, 4.5; 0.5, 4.5]; % [min_x, max_x; min_y, max_y]
+    
+    obstacleMap = zeros(2, numObstacles);
+    for i = 1:numObstacles
+        % Random X and Y generation
+        obstacleX = mapLimits(1,1) + (mapLimits(1,2) - mapLimits(1,1)) * rand();
+        obstacleY = mapLimits(2,1) + (mapLimits(2,2) - mapLimits(2,1)) * rand();
+        
+        % Ensure generated obstacle is not too close to the start point (0,0)
+        while sqrt(obstacleX^2 + obstacleY^2) < 0.5
+            obstacleX = mapLimits(1,1) + (mapLimits(1,2) - mapLimits(1,1)) * rand();
+            obstacleY = mapLimits(2,1) + (mapLimits(2,2) - mapLimits(2,1)) * rand();
+        end
+        obstacleMap(:, i) = [obstacleX; obstacleY];
+    end
+    
+    %% 2. DEFINE 10 TEST PATHS
+    
+    % Store all paths in a cell array for iteration
+    allPaths = cell(10, 1);
+    
+    % Path 1: Smooth Curve
+    allPaths{1}.x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    allPaths{1}.y = [0, 1.0, 3.0, 4.0, 4.5, 5.0];
+    allPaths{1}.name = 'P1: Smooth Curve';
+    
+    % Path 2: Sharp Turns
+    allPaths{2}.x = [0, 0.5, 4.5, 4.5, 5.0];
+    allPaths{2}.y = [0, 4.5, 4.5, 0.5, 5.0];
+    allPaths{2}.name = 'P2: Sharp Turns';
+    
+    % Path 3: Zig-Zag
+    allPaths{3}.x = [0, 2.0, 1.0, 3.0, 2.0, 4.0, 5.0];
+    allPaths{3}.y = [0, 1.0, 2.0, 3.0, 4.0, 4.5, 5.0];
+    allPaths{3}.name = 'P3: Zig-Zag';
+    
+    % Path 4: Diagonal
+    allPaths{4}.x = [0, 1.5, 3.0, 4.5, 5.0];
+    allPaths{4}.y = [0, 1.5, 3.0, 4.5, 5.0];
+    allPaths{4}.name = 'P4: Diagonal';
+    
+    % Path 5: Top Edge Hugging
+    allPaths{5}.x = [0, 0.5, 1.5, 3.5, 4.5, 5.0];
+    allPaths{5}.y = [0, 4.8, 4.8, 4.8, 4.8, 5.0];
+    allPaths{5}.name = 'P5: Top Edge Hugging';
+
+    % Path 6: Bottom Edge Hugging (Reverse Z)
+    allPaths{6}.x = [0, 4.8, 4.8, 4.8, 5.0];
+    allPaths{6}.y = [0, 0.5, 2.5, 4.5, 5.0];
+    allPaths{6}.name = 'P6: Bottom Edge Hugging';
+
+    % Path 7: Center Cross
+    allPaths{7}.x = [0, 2.5, 2.5, 5.0];
+    allPaths{7}.y = [0, 2.5, 4.5, 5.0];
+    allPaths{7}.name = 'P7: Center Cross';
+    
+    % Path 8: Left Wall S-Curve
+    allPaths{8}.x = [0, 0.2, 4.8, 0.2, 5.0];
+    allPaths{8}.y = [0, 2.0, 3.0, 4.8, 5.0];
+    allPaths{8}.name = 'P8: Left Wall S-Curve';
+    
+    % Path 9: Long Weave
+    allPaths{9}.x = [0, 1.0, 4.0, 2.0, 5.0];
+    allPaths{9}.y = [0, 4.0, 1.0, 4.5, 5.0];
+    allPaths{9}.name = 'P9: Long Weave';
+    
+    % Path 10: Late Turn
+    allPaths{10}.x = [0, 4.8, 4.8, 5.0];
+    allPaths{10}.y = [0, 0.2, 4.8, 5.0];
+    allPaths{10}.name = 'P10: Late Turn';
+
+    %% 3. PATH VALIDATION CHECK
+    fprintf('\nValidating paths against obstacles...\n');
+    validPathIndex = 0;
+    
+    for i = 1:length(allPaths)
+        currentPath = allPaths{i};
+        isClear = true;
+        
+        % Check if any obstacle intersects the line segments of the path
+        for j = 1:length(currentPath.x)-1
+            x1 = currentPath.x(j);
+            y1 = currentPath.y(j);
+            x2 = currentPath.x(j+1);
+            y2 = currentPath.y(j+1);
+            
+            % Check intersection with all obstacles
+            for k = 1:numObstacles
+                ox = obstacleMap(1, k);
+                oy = obstacleMap(2, k);
+                
+                % Call helper function to check line segment-circle intersection
+                if checkSegmentCircleCollision(x1, y1, x2, y2, ox, oy, obstacleRadius)
+                    isClear = false;
+                    fprintf('  ✗ Path %d (%s) blocked by obstacle at (%.2f, %.2f)\n', ...
+                            i, currentPath.name, ox, oy);
+                    break; % Stop checking obstacles for this segment
+                end
+            end
+            if ~isClear
+                break; % Stop checking segments for this path
+            end
+        end
+        
+        if isClear
+            validPathIndex = i;
+            fprintf('  ✔ Path %d (%s) is clear.\n', i, currentPath.name);
+            break; % Found the first clear path, so we stop the search
+        end
+    end
+    
+    if validPathIndex > 0
+        % Select the first clear path
+        routeNumber = validPathIndex;
+        xWaypoints = allPaths{routeNumber}.x;
+        yWaypoints = allPaths{routeNumber}.y;
+        fprintf('\nAuto-selecting Course %d: %s\n', routeNumber, allPaths{routeNumber}.name);
+    else
+        % Fallback: Use the diagonal path (Path 4) and proceed with a warning
+        routeNumber = 4;
+        xWaypoints = allPaths{routeNumber}.x;
+        yWaypoints = allPaths{routeNumber}.y;
+        warning('No obstacle-free path found among all 10 paths. Falling back to Path 4 (Diagonal).');
+    end
+    
+    % Display summary
+    fprintf('  Obstacles: %d points (Radius %.2f m)\n', size(obstacleMap, 2), obstacleRadius);
+    fprintf('  Goal: [%.1f, %.1f]\n', courseGoal(1), courseGoal(2));
+    fprintf('  Path waypoints: %d points\n\n', length(xWaypoints));
+    
+    %% PARAMETERS
+    % Configuration structure (use ALL_CFG for clarity)
+    ALL_CFG.limoIpPrefix = '192.168.1.';
+    ALL_CFG.limoTcpPort = 12345;
+    ALL_CFG.mqttBroker = 'mqtt://rasticvm.lan';
+    % Motion Capture (MoCap) Origin for Coordinate Transformation
+    ALL_CFG.mocapOriginX = -4.5;
+    ALL_CFG.mocapOriginY = 2.5;
+    
+    % Pure Pursuit Controller Parameters
+    ALL_CFG.lookaheadDist = 0.35;         % Lookahead distance [m]
+    ALL_CFG.targetLinearVel = 0.25;      % Desired constant forward velocity [m/s]
+    
+    % Dubins Path Planning Parameter
+    ALL_CFG.minTurnRadius = 0.2;       % Minimum turning radius [m]
+    ALL_CFG.recoveryDuration = 1.0;     % Time to execute recovery maneuver [s]
+    
+    % Goal Reached Tolerance
+    ALL_CFG.posTolerance = 0.2;         % Position tolerance to consider goal reached [m]
+    ALL_CFG.headingTolerance = deg2rad(25);% Heading tolerance [rad]
+    
+    % Safety Limits
+    ALL_CFG.maxLinVel = 0.25;             % Maximum linear velocity [m/s]
+    ALL_CFG.maxAngVel = deg2rad(60);     % Maximum angular velocity [rad/s]
+    ALL_CFG.maxTotalTime = 360;          % Maximum script execution time [s]
+    
+    % Control Loop Timing
+    ALL_CFG.controlRate = 30;            % Control loop frequency [Hz]
+    ALL_CFG.dt = 1/ALL_CFG.controlRate;  % Time step [s]
+    
+    % Initialize communication objects
+    tcpConnection = [];
+    mqttHandle = [];
+    
+    try
+        %% PREPARE NOMINAL PATH WAYPOINTS
+        fprintf('Validating and preparing waypoints...\n');
+        % Get total number of waypoints
+        numWaypoints = length(xWaypoints);
+        % Check for consistent array length
+        if length(yWaypoints) ~= numWaypoints
+            error('Waypoints and yWaypoints must have the same length');
+        end
+        
+        % Compute desired heading angle for each segment
+        % Store as x/y/theta
+        pathWaypoints = zeros(numWaypoints, 3);
+        for i = 1:numWaypoints-1
+            % Calculate displacement vector
+            dx = xWaypoints(i+1) - xWaypoints(i);
+            dy = yWaypoints(i+1) - yWaypoints(i);
+            % Calculate heading angle using atan2
+            segmentHeading = atan2(dy, dx);
+            % Store waypoint position and heading
+            pathWaypoints(i,:) = [xWaypoints(i), yWaypoints(i), segmentHeading];
+        end
+        % Assign the final waypoint the same heading as the second-to-last segment
+        pathWaypoints(numWaypoints,:) = [xWaypoints(numWaypoints), yWaypoints(numWaypoints), pathWaypoints(numWaypoints-1,3)];
+        fprintf('Waypoints processed: %d points\n', numWaypoints);
+        
+        %% LIMO TCP CONNECTION 
+        % Construct full IP address
+        fullLimoIp = [ALL_CFG.limoIpPrefix limoIpSuffix];
+        fprintf('Connecting to LIMO TCP: %s:%d\n', fullLimoIp, ALL_CFG.limoTcpPort);
+        % Create TCP client connection to LIMO
+        % NOTE: Requires 'tcpclient' which is standard in MATLAB since R2017a
+        tcpConnection = tcpclient(fullLimoIp, ALL_CFG.limoTcpPort, 'Timeout', 5);
+        % Send initial stop command
+        write(tcpConnection, uint8('0.00,0.00'));
+        pause(0.5);
+        
+        %% MQTT CONNECTION 
+        fprintf('Connecting to MQTT broker: %s\n', ALL_CFG.mqttBroker);
+        % NOTE: Requires 'mqttclient' which is available in MATLAB's Robotics System Toolbox or Instrument Control Toolbox
+        mqttHandle = mqttclient(ALL_CFG.mqttBroker);
+        % Subscribe to the robot's specific position topic
+        subscribe(mqttHandle, sprintf("rb/limo%s", limoIdNumber));
+        
+        % wait for steady mocap data
+        fprintf('\nWaiting for MoCap data to stabilize...\n');
+        waitTime = 2; % seconds
+        for i = 1:waitTime
+            fprintf('  %d/%d seconds... ', i, waitTime);
+            % Attempt to read pose data
+            [testPose, dataReceived] = fetchRobotPose(mqttHandle, limoIdNumber, ALL_CFG, [], 0);
+            if dataReceived
+                fprintf('Current data: (%.2f, %.2f, %.1f°)\n', testPose(1), testPose(2), rad2deg(testPose(3)));
+            else
+                fprintf('No data yet\n');
+            end
+            pause(1);
+        end
+        fprintf('Wait complete \n\n');
+        
+        % Get initial pose with multiple attempts
+        fprintf('Reading initial robot position...\n');
+        initialPoseFound = false;
+        maxAttempts = 5;
+        currentPose = [0, 0, 0];
+        for attempt = 1:maxAttempts
+            [currentPose, initialPoseFound] = fetchRobotPose(mqttHandle, limoIdNumber, ALL_CFG, [], 0);
+            if initialPoseFound
+                fprintf('Start pose: (%.2f, %.2f, %.1f°)\n', currentPose(1), currentPose(2), rad2deg(currentPose(3)));
+                break;
+            end
+            fprintf('  Attempt %d/%d: No data...\n', attempt, maxAttempts);
+            pause(0.5);
+        end
+        
+        % Check if initial pose was successfully obtained
+        if ~initialPoseFound
+            error('Cannot read MoCap data');
+        end
+        startPose = currentPose;
+        
+        %% GENERATE DUBINS PATH
+        fprintf('Generating smooth Dubins path between waypoints...\n');
+        % Initialize array for the final smooth path
+        fullDubinsPath = [];
+        % Create Dubins connection object with the specified minimum turning radius
+        % NOTE: Requires 'dubinsConnection' from Robotics System Toolbox
+        dubinsPlanner = dubinsConnection('MinTurningRadius', ALL_CFG.minTurnRadius);
+        
+        % Generate path segments between each waypoint pair
+        for i = 1:numWaypoints-1
+            % Get start and goal waypoints (with required heading)
+            startWp = pathWaypoints(i,:);
+            goalWp = pathWaypoints(i+1,:);
+            
+            % Generate Dubins curve segment
+            [segmentObject,~] = connect(dubinsPlanner, startWp, goalWp);
+            
+            % Check for path generation failure
+            if isempty(segmentObject)
+                error('Dubins path segment between waypoints %d and %d failed', i, i+1);
+            end
+            
+            % Interpolate points along the curve at 0.05m intervals
+            segmentPoints = interpolate(segmentObject{1}, 0:0.05:segmentObject{1}.Length);
+            if i>1
+                % Remove the first point (it's a duplicate of the previous segment's end)
+                segmentPoints = segmentPoints(2:end,:);
+            end
+            % Append segment points to the full path
+            fullDubinsPath = [fullDubinsPath; segmentPoints];
+        end
+        
+        % Extract path coordinates and calculate arc length
+        plannedPath.x = fullDubinsPath(:,1);  % X coordinates [m]
+        plannedPath.y = fullDubinsPath(:,2);  % Y coordinates [m]
+        % Calculate cumulative arc length 's'
+        pathSegmentDistances = sqrt(diff(plannedPath.x).^2 + diff(plannedPath.y).^2);
+        plannedPath.s = [0; cumsum(pathSegmentDistances)];
+        fprintf('Dubins path generated: %d points, total length = %.2f m\n', ...
+                length(plannedPath.x), plannedPath.s(end));
+        
+        
+    %% VISUALIZATION SETUP
+    figure('Name','LIMO Path Following','Position',[100 100 1000 800]);
+    % Plot obstacles as black circles
+    if ~isempty(obstacleMap)
+        % Plot obstacle centers as black dots
+        plot(obstacleMap(1,:), obstacleMap(2,:), 'ko', 'MarkerSize', 12, 'MarkerFaceColor', 'k', 'DisplayName', 'Obstacles');
+    end
+    hold on; grid on; axis equal;
+    % Plot initial planned waypoints as dashed blue line with circle markers
+    plot(xWaypoints, yWaypoints, 'b--o', 'LineWidth', 2.5, 'MarkerSize', 5, 'DisplayName', 'Waypoints');
+    % Plot the final Dubins path as green line
+    plot(plannedPath.x, plannedPath.y, 'g-', 'LineWidth', 1.0, 'DisplayName', 'Dubins Path');
+    % Plot goal position as blue x
+    plot(courseGoal(1), courseGoal(2), 'bx', 'MarkerSize', 25, 'LineWidth', 3, 'DisplayName', 'Goal');
+    % Plot start position as a red asterisk
+    plot(startPose(1), startPose(2), 'r*', 'MarkerSize', 18, 'MarkerFaceColor', 'r', 'DisplayName', 'Start');
+    % Initialize robot trajectory plot 
+    actualTrajectoryPlot = plot(NaN, NaN, 'k:', 'LineWidth', 3.0, 'DisplayName', 'Actual Path');
+    % Initialize robot position marker as green circle
+    robotMarker = plot(NaN, NaN, 'go', 'MarkerSize', 14, 'MarkerFaceColor', 'g', 'DisplayName', 'Robot');
+    % Initialize lookahead point marker as smaller red circle
+    lookaheadMarker = plot(NaN, NaN, 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r', 'DisplayName', 'Lookahead Point');
+    % Add labels and legend
+    xlabel('X Position [m]'); ylabel('Y Position [m]');
+    title(sprintf('LIMO %s - Pure Pursuit Control (Course %d: %s)', limoIdNumber, routeNumber, allPaths{routeNumber}.name));
+    legend('Location', 'best');
+    
+    % Pad the axis limits for safety reasons
+    xlim([-0.5 5.5]); 
+    ylim([-0.5 5.5]); 
+    
+        %% CONTROL LOOP
+        fprintf('\nStarting control loop...\n');
+        fprintf('Goal: (%.2f, %.2f)\n', courseGoal(1), courseGoal(2));
+        % Initialize control variables
+        timerStart = tic;                 % Start timer for elapsed time
+        currentRobotPose = startPose;     % Current robot pose [x, y, theta]
+        robotTrajectory = startPose(1:2); % Store trajectory points
+        % Loop detection variables
+        errorHistory = [];                   % History of crosstrack errors
+        recoveryTimer = [];                  % Timer for recovery maneuver
+        
+        % Main loop: runs until goal is reached or timeout
+        while true
+            loopStartTime = tic;  % Time this iteration for rate control
+            
+            % Get current robot state from MoCap 
+            previousPose = currentRobotPose;
+            [currentRobotPose, dataValid] = fetchRobotPose(mqttHandle, limoIdNumber, ALL_CFG, previousPose, ALL_CFG.dt);
+            if ~dataValid
+                fprintf(' Lost MoCap data - keeping previous command\n');
+                continue; % Skip this iteration and try again
+            end
+            
+            % Extract current position and heading
+            currentX = currentRobotPose(1);
+            currentY = currentRobotPose(2);
+            currentTheta = currentRobotPose(3);
+            
+            % Calculate elapsed time
+            elapsedTime = toc(timerStart);
+            
+            % Check if destination is reached 
+            distanceToGoal = sqrt((currentX - courseGoal(1))^2 + (currentY - courseGoal(2))^2);
+            if distanceToGoal < ALL_CFG.posTolerance
+                fprintf('\n Goal reached at %.1f s\n', elapsedTime);
+                write(tcpConnection, uint8('0.00,0.00')); % Stop robot
+                break;
+            end
+            
+            % Find the Pure Pursuit lookahead point 
+            [lookaheadX, lookaheadY, lookaheadIndex, crossTrackError] = findLookahead(currentX, currentY, plannedPath, ALL_CFG.lookaheadDist);
+            
+            
+            % LOOP DETECTION
+            errorHistory = [errorHistory, crossTrackError];
+            % Keep only the last 30 error samples
+            if length(errorHistory) > 30
+                errorHistory = errorHistory(end-29:end);
+            end
+           
+            % RECOVERY
+            if ~isempty(recoveryTimer)
+                recoveryElapsed = toc(recoveryTimer);
+                if recoveryElapsed < ALL_CFG.recoveryDuration
+                    % Recovery: Stop linear motion and rotate
+                    linearVelocityCommand = 0.0;
+                    angularVelocityCommand = deg2rad(30); % Rotate right
+                    fprintf('  Recovery: reorienting (%.1f/%.1f s)\n', recoveryElapsed, ALL_CFG.recoveryDuration);
+                else
+                    % Recovery complete
+                    fprintf('Recovery complete\n');
+                    recoveryTimer = []; % Clear recovery timer
+                end
+            else
+                % Pure Pursuit Control Law
+                % Calculate the desired heading towards the lookahead point
+                dx = lookaheadX - currentX;
+                dy = lookaheadY - currentY;
+                desiredHeading = atan2(dy, dx);
+                
+                % Calculate heading error (wrapped to [-pi, pi])
+                headingError = wrapToPi(desiredHeading - currentTheta);
+                
+                % Calculate distance to lookahead point
+                distanceToLookahead = sqrt(dx^2 + dy^2);
+                
+                % Pure Pursuit formula for angular velocity:
+                % w = (2 * V_desired * sin(error)) / lookahead_distance
+                angularVelocityCommand = (2 * ALL_CFG.targetLinearVel * sin(headingError)) / distanceToLookahead;
+                
+                % Linear velocity: reduce speed if heading error is large
+                if abs(headingError) < deg2rad(90)
+                    % Scale velocity by cos(error) for smooth slowing in turns
+                    linearVelocityCommand = ALL_CFG.targetLinearVel * cos(headingError);
+                else
+                    % Very large error: use minimum forward speed to allow rotation to fix
+                    linearVelocityCommand = ALL_CFG.targetLinearVel * 0.3;
+                end
+            end
+            
+            % Apply velocity limits
+            % make certain linear velocity is only positive
+            linearVelocityCommand = max(0, min(linearVelocityCommand, ALL_CFG.maxLinVel));
+            angularVelocityCommand = max(-ALL_CFG.maxAngVel, min(angularVelocityCommand, ALL_CFG.maxAngVel));
+            
+            % Send velocity command to LIMO
+            commandString = sprintf('%.2f,%.2f', linearVelocityCommand, angularVelocityCommand);
+            write(tcpConnection, uint8(commandString));
+            
+            % Update visualization 
+            robotTrajectory = [robotTrajectory; currentX, currentY]; % Append current position
+            set(robotMarker, 'XData', currentX, 'YData', currentY);
+            set(actualTrajectoryPlot, 'XData', robotTrajectory(:,1), 'YData', robotTrajectory(:,2));
+            set(lookaheadMarker, 'XData', lookaheadX, 'YData', lookaheadY);
+            
+            % Update plot title with real-time status
+            title(sprintf('LIMO %s - Course %d | t=%.1fs | distToGoal=%.2fm |  V=%.2f, W=%.1f°/s', ...
+                         limoIdNumber, routeNumber, elapsedTime, distanceToGoal,  linearVelocityCommand, rad2deg(angularVelocityCommand)));
+            drawnow limitrate; % Update figure view
+            
+            %  Safety timeout check 
+            if elapsedTime > ALL_CFG.maxTotalTime
+                fprintf('✗ Maximum time limit reached, stopping the code\n');
+                break;
+            end
+            
+            % Maintain control loop rate 
+            loopDuration = toc(loopStartTime);
+            if loopDuration < ALL_CFG.dt
+                pause(ALL_CFG.dt - loopDuration); % Wait to maintain desired rate
+            end
+        end
+        
+    catch exception
+        % Error handling: display error message and location
+        fprintf('Error: %s\n', exception.message);
+        if ~isempty(exception.stack)
+            fprintf('  In: %s (line %d)\n', exception.stack(1).name, exception.stack(1).line);
+        end
+    end
+    
+    %% CLEANUP AND SHUTDOWN
+    % Ensure robot is stopped and connections are closed
+    if ~isempty(tcpConnection) && isvalid(tcpConnection)
+        write(tcpConnection, uint8('0.00,0.00')); % Send final stop command
+        pause(0.5);
+        clear tcpConnection; % Close TCP connection
+    end
+    if ~isempty(mqttHandle)
+        clear mqttHandle; % Close MQTT connection
+    end
+    fprintf('Script execution finished.\n\n');
+end
+%% HELPER FUNCTION: LINE SEGMENT-CIRCLE COLLISION CHECK (UNCHANGED)
+function collision = checkSegmentCircleCollision(x1, y1, x2, y2, ox, oy, radius)
+% Checks if the line segment (x1,y1) to (x2,y2) intersects a circle (ox,oy) with radius.
+    
+    % 1. Vector from segment start to obstacle center
+    Ax = ox - x1;
+    Ay = oy - y1;
+    
+    % 2. Vector of the segment
+    Bx = x2 - x1;
+    By = y2 - y1;
+    
+    % 3. Calculate 't' (projection of A onto B, clamped to [0, 1])
+    % t = (A . B) / |B|^2
+    segmentLengthSq = Bx^2 + By^2;
+    if segmentLengthSq == 0
+        % Segment is a point. Check distance to circle center.
+        distSq = Ax^2 + Ay^2;
+        collision = (distSq <= radius^2);
+        return;
+    end
+    
+    dotProduct = Ax * Bx + Ay * By;
+    t = dotProduct / segmentLengthSq;
+    
+    % Clamp t to ensure the closest point is on the segment
+    t = max(0, min(1, t));
+    
+    % 4. Find the closest point (Px, Py) on the segment to the obstacle center
+    Px = x1 + t * Bx;
+    Py = y1 + t * By;
+    
+    % 5. Calculate the distance squared from obstacle center to the closest point
+    distToClosestPointSq = (ox - Px)^2 + (oy - Py)^2;
+    
+    % 6. Check for collision
+    collision = (distToClosestPointSq <= radius^2);
+end
+
+%% HELPER FUNCTION TO GET ROBOT POSE FROM MQTT (UNCHANGED)
+function [pose, dataValid] = fetchRobotPose(mqttHandle, limoNum, ALL_CFG, prevPose, dt)
+    pose = [0, 0, 0];
+    dataValid = false;
+    try
+        mqttMessage = peek(mqttHandle);
+        if isempty(mqttMessage)
+            return;
+        end
+        expectedTopic = sprintf('rb/limo%s', limoNum);
+        if ~strcmp(char(mqttMessage.Topic), expectedTopic)
+            return;
+        end
+        jsonString = char(mqttMessage.Data);
+        dataJson = jsondecode(jsonString);
+        if ~isfield(dataJson, 'pos') || ~isfield(dataJson, 'rot')
+            return;
+        end
+        mocapX = dataJson.pos(1);
+        mocapY = dataJson.pos(3);
+        x = mocapX - ALL_CFG.mocapOriginX;
+        y = -(mocapY - ALL_CFG.mocapOriginY);
+        
+        if ~isempty(prevPose) && dt > 0
+            dx = x - prevPose(1);
+            dy = y - prevPose(2);
+            currentSpeed = sqrt(dx^2 + dy^2) / dt;
+            speedThreshold = 0.05;
+            if currentSpeed > speedThreshold
+                theta = atan2(dy, dx);
+            else
+                theta = prevPose(3);
+            end
+        else
+            if length(dataJson.rot) >= 3
+                theta = -dataJson.rot(3);
+            else
+                theta = 0;
+            end
+        end
+        pose = [x, y, theta];
+        dataValid = true;
+    catch
+    end
+end
+%% HELPER FUNCTION: FIND LOOKAHEAD POINT (UNCHANGED)
+function [lookaheadX, lookaheadY, lookaheadIndex, crossTrackError] = ...
+    findLookahead(robotX, robotY, plannedPath, lookaheadDistance)
+    
+    allDistances = sqrt((plannedPath.x - robotX).^2 + (plannedPath.y - robotY).^2);
+    [crossTrackError, closestIndex] = min(allDistances);
+    
+    sClosest = plannedPath.s(closestIndex);
+    sLookaheadTarget = sClosest + lookaheadDistance;
+    
+    if sLookaheadTarget > plannedPath.s(end)
+        lookaheadIndex = length(plannedPath.x);
+    else
+        lookaheadIndex = find(plannedPath.s >= sLookaheadTarget, 1, 'first');
+        if isempty(lookaheadIndex)
+            lookaheadIndex = length(plannedPath.x);
+        end
+    end
+    
+    lookaheadX = plannedPath.x(lookaheadIndex);
+    lookaheadY = plannedPath.y(lookaheadIndex);
+end
+
+
+
