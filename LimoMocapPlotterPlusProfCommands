@@ -4,9 +4,8 @@
 
 brokerAddress = "mqtt://rasticvm.lan";
 
-% -------------------------------------------------------------------------
-% 🌐 --- Global Variable Declaration ---
-% -------------------------------------------------------------------------
+%% --- Global Variable Declaration ---
+
 % Global variables are required to allow the callback function to update the map and plot
 global RobotPositions; 
 global PlotHandle;           % Handle for the scatter plot object (points)
@@ -22,9 +21,8 @@ robotID = "799";               % Use '#' to subscribe to all sub-topics under 'r
 topic = "rb/#"; %topic for robot positions, other 2 topics are initialized under the subscribe functions
 StopFlag = false;
 
-% -------------------------------------------------------------------------
-% 🎨 --- Plot Initialization ---
-% -------------------------------------------------------------------------
+%% --- Plot Initialization ---
+
 % Create a figure and axes once at the start
 FigureHandle = figure('Name', 'Live Robot Positions (X-Z Plane)');
 grid on;
@@ -34,11 +32,9 @@ ylabel('Z Coordinate');
 axis manual; % Prevents MATLAB from auto-scaling axes aggressively
 axis equal; % Ensures correct aspect ratio
 
-% 1. 🔥 CHANGE: Set initial axes limits to an 8x5 grid (X: -4 to 4, Z: -2.5 to 2.5)
 xlim([-4 4]); 
 ylim([-2.5 2.5]);
 
-% 2. 🔥 CHANGE: Set up the CloseRequestFcn to handle manual figure closing
 set(FigureHandle, 'CloseRequestFcn', @figureCloseHandler);
 
 % Initialize the plot handles with empty data. 
@@ -48,9 +44,7 @@ PlotHandle = plot(NaN, NaN, 'o', 'MarkerSize', 8, 'MarkerFaceColor', 'b', 'Displ
 RobotLabelsHandle = gobjects(0); % Initialize label handles as an array of graphics objects
 hold off;
 
-% -------------------------------------------------------------------------
-% 🔗 --- Connection Setup ---
-% -------------------------------------------------------------------------
+%% ---- Connection Setup ---
 try 
     clear mqttClient
 catch
@@ -78,10 +72,7 @@ try
 catch ME
     error('MQTT_SETUP:FailedConnect', 'Could not connect to the MQTT broker. Error: %s', ME.message);
 end
-
-% -------------------------------------------------------------------------
-% ⏳ --- Auto-Stop Timer Setup ---
-% -------------------------------------------------------------------------
+%% --- Auto-Stop Timer Setup ---
 stopTimer = timer;
 stopTimer.StartDelay = 60; % Set timer to 60 seconds
 stopTimer.TimerFcn = @(myTimer, event) setStopFlag(); 
@@ -90,9 +81,7 @@ start(stopTimer);
 disp('Asynchronously listening for robot position updates. The plot will update live.');
 disp('The script will automatically stop after 60 seconds, or if the plot window is closed.');
 
-% -------------------------------------------------------------------------
-% 🔄 --- Execution Loop ---
-% -------------------------------------------------------------------------
+%% --- Execution Loop ---
 while ~StopFlag
     % pause(0.1) keeps MATLAB responsive and allows the timer and callback functions to execute
     pause(0.1); 
@@ -115,18 +104,14 @@ for k = keyList
     disp(['Position: ', mat2str(RobotPositions(k{1}))])
 end 
 
-% -------------------------------------------------------------------------
-% 🛑 --- Stop Flag Functions ---
-% -------------------------------------------------------------------------
-
+%% --- Stop Flag Functions ---
 % Timer Callback Function
 function setStopFlag()
     global StopFlag;
     StopFlag = true;
-    disp('*** 60 seconds elapsed. Setting StopFlag to terminate the script. ***');
+    disp('*** 60 seconds elapsed, terminating the script. ***');
 end
 
-% 🔥 NEW FUNCTION: Figure Close Handler
 function figureCloseHandler(src, event)
     global StopFlag;
     StopFlag = true;
@@ -135,9 +120,7 @@ function figureCloseHandler(src, event)
     delete(src); 
 end
 
-% -------------------------------------------------------------------------
-% 🤖 --- Message Handling Function --- 📈
-% -------------------------------------------------------------------------
+%%--- Message Handling Function --- 
 function robotMessageHandler(topic, data)
     global RobotPositions;
     global FigureHandle;
@@ -163,7 +146,6 @@ function robotMessageHandler(topic, data)
         
         if hasChanged
             RobotPositions(topic) = robotPosition;
-            %disp(['[UPDATED] Topic: ', topic, ' | Position: ', mat2str(robotPosition)])
             updateLivePlot();
         end
         
@@ -179,8 +161,7 @@ end
 % Command Handling Function
 function robotCommandsHandler(topic, data)
     global MainCommand; 
-    MainCommand = data; % Should be STOP, GO, WAIT, etc
-
+    MainCommand = data; % STOP GO WAIT
     % disp("command: ")
     % MainCommand
 end
@@ -190,23 +171,16 @@ function robotGoalHandler(topic, data)
     global GOALS; 
     GOALS = data; %this is a json data structure
 
-    % if GOAL
-    %    goal = jsondecode(GOAL);
-    %    disp("goal: ")
-    %    goal
-    % end
+
 
 end
 
-% -------------------------------------------------------------------------
-% 🎨 --- Live Plot Update Function (Optimized for Speed and Throttling) ---
-% -------------------------------------------------------------------------
+%% --- Live Plot Update Function (Optimized for Speed and Throttling) ---
 function updateLivePlot()
     global RobotPositions;
     global PlotHandle;
     global RobotLabelsHandle;
     global FigureHandle;
-    
     persistent LastPlotTime 
     
     if isempty(LastPlotTime)
