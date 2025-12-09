@@ -1,12 +1,8 @@
-% MATLAB Live Robot Position Plotter (Optimized)
-% This script connects to an MQTT broker, subscribes to robot position
-% updates, and plots the X-Z position of all robots in real-time.
-
+%Lab 3 Plotter
 brokerAddress = "mqtt://rasticvm.lan";
 
 %% --- Global Variable Declaration ---
 
-% Global variables are required to allow the callback function to update the map and plot
 global RobotPositions; 
 global PlotHandle;           % Handle for the scatter plot object (points)
 global RobotLabelsHandle;    % Handle for the text labels (for cleaning up)
@@ -29,7 +25,7 @@ grid on;
 title('Live Robot Positions (X vs Z)');
 xlabel('X Coordinate');
 ylabel('Z Coordinate');
-axis manual; % Prevents MATLAB from auto-scaling axes aggressively
+axis manual; 
 axis equal; % Ensures correct aspect ratio
 
 xlim([-4 4]); 
