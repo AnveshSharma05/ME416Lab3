@@ -1,4 +1,4 @@
-%Lab 3 Plotter
+%Lab 3 Plotter code
 brokerAddress = "mqtt://rasticvm.lan";
 
 %% --- Global Variable Declaration ---
@@ -9,12 +9,12 @@ global RobotLabelsHandle;    % Handle for the text labels (for cleaning up)
 global FigureHandle;         % Handle for the main figure
 global StopFlag;             % Flag for auto-stop control
 global MainCommand;          % Main command to control STOP, WAIT, GO, HALT
-global GOAL;                 % IS JSON JSON JSON DONT FORGET given by MQTT as the final position of robot
+global GOAL;                 % value given by MQTT as the final position of robot
 
 % Initialization
 RobotPositions = containers.Map('KeyType', 'char', 'ValueType', 'any');
-robotID = "799";               % Use '#' to subscribe to all sub-topics under 'rb/'
-topic = "rb/#"; %topic for robot positions, other 2 topics are initialized under the subscribe functions
+robotID = "799";             
+topic = "rb/#";   % Use '#' to subscribe to all sub-topics under 'rb/
 StopFlag = false;
 
 %% --- Plot Initialization ---
@@ -70,7 +70,7 @@ catch ME
 end
 %% --- Auto-Stop Timer Setup ---
 stopTimer = timer;
-stopTimer.StartDelay = 60; % Set timer to 60 seconds
+stopTimer.StartDelay = 60; % Set timer to 60 seconds to kick out if there's problems
 stopTimer.TimerFcn = @(myTimer, event) setStopFlag(); 
 stopTimer.StopFcn = @(myTimer, event) delete(myTimer); 
 start(stopTimer);
@@ -224,12 +224,12 @@ function updateLivePlot()
         end
     end
     
-    % B. Update Plot Data (FASTEST WAY: Use set on existing handle)
+    % B. Update Plot Data
     if ~isempty(allX) 
         
         set(PlotHandle, 'XData', allX, 'YData', allZ);
         
-        % C. Optimized Axes Limits (Only expand if necessary)
+        % C. Optimized Axes Limits
         ax = gca;
         currentXLim = get(ax, 'XLim');
         currentYLim = get(ax, 'YLim');
