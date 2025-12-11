@@ -3,12 +3,14 @@ function lab3_simulator(varargin)
 % - Treats ALL robots (Moving, Waiting, Done) as obstacles for planning.
 % - Treats ALL robots as collision risks for the sensor.
 % - Hybrid Logic: Visuals + Path Smoothing + Smart Recovery.
+% - Does not need to be run with MQTT connections
+% - Does need Navigation Toolbox
 
 % ------------- Parse options -------------
 p = inputParser;
-addParameter(p,'numRobots',12,@(x)isnumeric(x)&&x>=1);
-addParameter(p,'numRows',14,@(x)isnumeric(x)&&x>=3); 
-addParameter(p,'numCols',16,@(x)isnumeric(x)&&x>=3); 
+addParameter(p,'numRobots',12,@(x)isnumeric(x)&&x>=1); % Grid size based on the RASTIC arena
+addParameter(p,'numRows',14,@(x)isnumeric(x)&&x>=3);
+addParameter(p,'numCols',16,@(x)isnumeric(x)&&x>=3);
 addParameter(p,'gridSize',0.5,@isnumeric);
 addParameter(p,'simTime',180,@isnumeric);
 addParameter(p,'dt',0.1,@isnumeric);
@@ -19,17 +21,17 @@ parse(p,varargin{:});
 opts = p.Results;
 
 % --- Parameters ---
-BLOCKING_TIMEOUT = 2.0; 
-MANEUVER_DURATION = 0.1; % As requested in your snippet
-robotLength = 0.25;  
-robotWidth  = 0.16;  
-robotRadius = 0.2;   
-vMax = 0.25; omegaMax = 1.2; 
+BLOCKING_TIMEOUT = 2.0;
+MANEUVER_DURATION = 0.1; 
+robotLength = 0.25; %Robot size of agile x limos
+robotWidth  = 0.16;
+robotRadius = 0.2;
+vMax = 0.25; omegaMax = 1.2;
 vReverse = -0.15;
 vForwardManeuver = 0.15;
-lookahead = 0.30;    
-viewDepth = 0.6; viewWidthFront = 0.5; viewWidthBack = 0.15; 
-goalTolerance = 0.15; 
+lookahead = 0.30;
+viewDepth = 0.6; viewWidthFront = 0.5; viewWidthBack = 0.15;
+goalTolerance = 0.15;
 
 % ------------- Environment -------------
 numRows = opts.numRows; numCols = opts.numCols; gridSize = opts.gridSize;
@@ -42,7 +44,7 @@ gridToWorld = @(rc) deal(originX + (rc(:,2)-1)*gridSize, originY + (rc(:,1)-1)*g
 
 % Static Obstacles
 occ = zeros(numRows, numCols);
-occ(1,:) = 1; occ(end,:) = 1; occ(:,1) = 1; occ(:,end) = 1; 
+occ(1,:) = 1; occ(end,:) = 1; occ(:,1) = 1; occ(:,end) = 1;
 for r=1:numRows
     for c=1:numCols
         if occ(r,c)==1
@@ -53,16 +55,18 @@ for r=1:numRows
 end
 
 % ------------- Setup Agents (Edge Starts) -------------
+%-All robots start on the edge
+
 numRobots = opts.numRobots; dt = opts.dt; tFinal = opts.simTime;
 freeCells = find(occ==0);
 [fr,fc] = ind2sub(size(occ), freeCells);
 freeRC = [fr, fc];
-rng(0); 
+rng(3);
 
 edgeIndices = find(freeRC(:,1) == 2 | freeRC(:,1) == numRows-1 | ...
-                   freeRC(:,2) == 2 | freeRC(:,2) == numCols-1);
+    freeRC(:,2) == 2 | freeRC(:,2) == numCols-1);
 edgeRC = freeRC(edgeIndices, :);
-if size(edgeRC,1) < numRobots, error('Not enough edge cells.'); end
+if size(edgeRC,1) < numRobots, error('Not enough edge cells.'); end %Error goes off if there are too many robots selected in the simulation
 
 permEdge = randperm(size(edgeRC,1));
 startRC_all = edgeRC(permEdge(1:numRobots), :);
@@ -79,21 +83,21 @@ robots = repmat(struct(), numRobots, 1);
 for i=1:numRobots
     [sx, sy] = gridToWorld(startRC_all(i,:));
     [gx, gy] = gridToWorld(goalRC_all(i,:));
-    
+
     dx = gx - sx; dy = gy - sy;
     initialTheta = atan2(dy, dx);
-    
+
     robots(i).id = i;
-    robots(i).pose = [sx, sy, initialTheta];      
-    robots(i).vel = [0, 0];                 
+    robots(i).pose = [sx, sy, initialTheta];
+    robots(i).vel = [0, 0];
     robots(i).goal = [gx, gy];
-    robots(i).path = [];   
-    robots(i).pathIdx = 1; 
-    robots(i).lookPoint = [sx, sy]; 
-    robots(i).state = 'PLANNING'; 
+    robots(i).path = [];
+    robots(i).pathIdx = 1;
+    robots(i).lookPoint = [sx, sy];
+    robots(i).state = 'PLANNING';
     robots(i).waitStartTime = -inf;
     robots(i).maneuverEndTime = -inf;
-    robots(i).maneuverType = 'reverse'; 
+    robots(i).maneuverType = 'reverse';
 end
 
 % ------------- Visualization Setup -------------
@@ -117,11 +121,11 @@ for r=1:numRows
 end
 
 colors = lines(numRobots);
-hBody = gobjects(numRobots,1);   
-hTrap = gobjects(numRobots,1);   
+hBody = gobjects(numRobots,1);
+hTrap = gobjects(numRobots,1);
 hGoal = gobjects(numRobots,1);
 hPath = gobjects(numRobots,1);
-hLookahead = gobjects(numRobots,1); 
+hLookahead = gobjects(numRobots,1);
 hTextRobot = gobjects(numRobots,1);
 hTextGoal = gobjects(numRobots,1);
 
@@ -136,187 +140,188 @@ for i=1:numRobots
     hTextGoal(i) = text(ax, robots(i).goal(1), robots(i).goal(2) + 0.15, sprintf('G%d', i), 'Color', color, 'FontSize', 8, 'HorizontalAlignment', 'center', 'FontWeight', 'bold');
 end
 drawnow;
-pause(1); 
+pause(1);
 
 % ------------- Main Loop -------------
 t = 0;
 while t < tFinal
+    if ~ishandle(fig), break; end  % Added to cleanly break the loop when the figure is removed so there is no red text error messages in the terminal
+
+        for i=1:numRobots
+            switch robots(i).state
     
-    for i=1:numRobots
-        switch robots(i).state
-            
-            case 'PLANNING'
-                occ_snapshot = occ; 
-                for j=1:numRobots
-                    if j==i, continue; end
-                    % REMOVED: if strcmp(robots(j).state, 'DONE'), continue; end
-                    
-                    % TREAT ALL ROBOTS (Moving, Waiting, Done) AS OBSTACLES
-                    occ_snapshot = inflate_occupancy_with_rectangle(occ_snapshot, robots(j).pose(1), robots(j).pose(2), robotWidth*2.5, robotLength*2.5, gridSize, originX, originY);
-                end
-                
-                rc_start = clampRC(worldToGridRC(robots(i).pose(1:2), gridSize, originX, originY), numRows, numCols);
-                rc_goal  = clampRC(worldToGridRC(robots(i).goal, gridSize, originX, originY), numRows, numCols);
-                
-                pathRC = astar_planner_local(occ_snapshot, rc_start, rc_goal);
-                
-                if ~isempty(pathRC)
-                    [wx,wy] = gridPathToWorld_local(double(pathRC), gridSize, originX, originY);
-                    simplePath = simplify_path_line_of_sight([wx, wy], occ_snapshot, gridSize, originX, originY);
-                    robots(i).path = densify_path(simplePath, 0.1); 
-                    robots(i).pathIdx = max(1, find_next_waypoint_index(robots(i).pose(1:2), robots(i).path));
-                    robots(i).state = 'MOVING';
-                else
-                    robots(i).state = 'MANEUVERING';
-                    if rand() < 0.5, robots(i).maneuverType = 'reverse'; else, robots(i).maneuverType = 'forward'; end
-                    robots(i).maneuverEndTime = t + MANEUVER_DURATION;
-                end
-                
-            case 'MOVING'
-                if norm(robots(i).pose(1:2) - robots(i).goal) < goalTolerance
-                    robots(i).state = 'DONE';
-                    robots(i).vel = [0,0];
-                    continue;
-                end
-                
-                % Calculate distance to goal
-                distToGoal = norm(robots(i).pose(1:2) - robots(i).goal);
-                
-                % If we are close to the goal, shrink the sensor so we don't see the wall BEHIND it
-                currentViewDepth = min(viewDepth, distToGoal + 0.1); 
-                
-                trapPoly = trapezoid_in_front(robots(i).pose, currentViewDepth, viewWidthBack, viewWidthFront);
-                blocked = false;
-                
-                % 1. Check ALL Robots (Moving or Done)
-                for j=1:numRobots
-                    if j==i, continue; end
-                    % REMOVED: if strcmp(robots(j).state, 'DONE'), continue; end
-                    if inpolygon(robots(j).pose(1), robots(j).pose(2), trapPoly(:,1), trapPoly(:,2))
-                        blocked = true; break;
+                case 'PLANNING'
+                    occ_snapshot = occ;
+                    for j=1:numRobots
+                        if j==i, continue; end
+    
+                        % TREAT ALL ROBOTS (Moving, Waiting, Done) AS OBSTACLES
+                        occ_snapshot = inflate_occupancy_with_rectangle(occ_snapshot, robots(j).pose(1), robots(j).pose(2), robotWidth*2.5, robotLength*2.5, gridSize, originX, originY);
                     end
-                end
-                
-                % 2. Check Static Obstacles & World Bounds
-                if ~blocked
-                    % Check vertices of trapezoid against grid
-                    for vIdx = 1:4
-                        vx = trapPoly(vIdx, 1); vy = trapPoly(vIdx, 2);
-                        
-                        % A. Out of Bounds Check
-                        if vx < worldMinX || vx > worldMaxX || vy < worldMinY || vy > worldMaxY
+    
+                    rc_start = clampRC(worldToGridRC(robots(i).pose(1:2), gridSize, originX, originY), numRows, numCols);
+                    rc_goal  = clampRC(worldToGridRC(robots(i).goal, gridSize, originX, originY), numRows, numCols);
+    
+                    pathRC = astar_planner_local(occ_snapshot, rc_start, rc_goal);
+    
+                    if ~isempty(pathRC)
+                        [wx,wy] = gridPathToWorld_local(double(pathRC), gridSize, originX, originY);
+                        simplePath = simplify_path_line_of_sight([wx, wy], occ_snapshot, gridSize, originX, originY);
+                        robots(i).path = densify_path(simplePath, 0.1);
+                        robots(i).pathIdx = max(1, find_next_waypoint_index(robots(i).pose(1:2), robots(i).path));
+                        robots(i).state = 'MOVING';
+                    else
+                        robots(i).state = 'MANEUVERING';
+                        if rand() < 0.5, robots(i).maneuverType = 'reverse'; else, robots(i).maneuverType = 'forward'; end
+                        robots(i).maneuverEndTime = t + MANEUVER_DURATION;
+                    end
+    
+                case 'MOVING'
+                    if norm(robots(i).pose(1:2) - robots(i).goal) < goalTolerance
+                        robots(i).state = 'DONE';
+                        robots(i).vel = [0,0];
+                        continue;
+                    end
+    
+                    % Calculate distance to goal
+                    distToGoal = norm(robots(i).pose(1:2) - robots(i).goal);
+    
+                    % If we are close to the goal, shrink the sensor so we don't see the wall BEHIND it
+                    % Still error prone if robot approaches the wall at an
+                    % angle, rng(1) is a good example of that
+                    currentViewDepth = min(viewDepth, distToGoal + 0.1);
+    
+                    trapPoly = trapezoid_in_front(robots(i).pose, currentViewDepth, viewWidthBack, viewWidthFront);
+                    blocked = false;
+    
+                    % 1. Check ALL Robots (Moving or Done)
+                    for j=1:numRobots
+                        if j==i, continue; end
+                        if inpolygon(robots(j).pose(1), robots(j).pose(2), trapPoly(:,1), trapPoly(:,2))
                             blocked = true; break;
                         end
-                        
-                        % B. Static Wall Check
-                        rc_v = worldToGridRC([vx, vy], gridSize, originX, originY);
-                        if rc_v(1) >= 1 && rc_v(1) <= numRows && rc_v(2) >= 1 && rc_v(2) <= numCols
-                             if occ(rc_v(1), rc_v(2)) == 1
-                                 blocked = true; break;
-                             end
+                    end
+    
+                    % 2. Check Static Obstacles & World Bounds
+                    if ~blocked
+                        % Check vertices of trapezoid against grid
+                        for vIdx = 1:4
+                            vx = trapPoly(vIdx, 1); vy = trapPoly(vIdx, 2);
+    
+                            % A. Out of Bounds Check
+                            if vx < worldMinX || vx > worldMaxX || vy < worldMinY || vy > worldMaxY
+                                blocked = true; break;
+                            end
+    
+                            % B. Static Wall Check
+                            rc_v = worldToGridRC([vx, vy], gridSize, originX, originY);
+                            if rc_v(1) >= 1 && rc_v(1) <= numRows && rc_v(2) >= 1 && rc_v(2) <= numCols
+                                if occ(rc_v(1), rc_v(2)) == 1
+                                    blocked = true; break;
+                                end
+                            end
                         end
                     end
-                end
-                
-                if blocked
-                    robots(i).state = 'WAITING';
-                    robots(i).waitStartTime = t;
-                    robots(i).vel = [0,0];
-                else
-                    if isempty(robots(i).path)
-                        robots(i).state = 'PLANNING'; 
+    
+                    if blocked
+                        robots(i).state = 'WAITING';
+                        robots(i).waitStartTime = t;
+                        robots(i).vel = [0,0];
                     else
-                        [lookPt, newIdx] = pure_pursuit_lookahead(robots(i).pose, robots(i).path, robots(i).pathIdx, lookahead);
-                        robots(i).pathIdx = newIdx;
-                        robots(i).lookPoint = lookPt; 
-                        [v, w] = compute_unicycle_to_point(robots(i).pose, lookPt, vMax, omegaMax);
-                        robots(i).vel = [v*cos(robots(i).pose(3)), v*sin(robots(i).pose(3))];
+                        if isempty(robots(i).path)
+                            robots(i).state = 'PLANNING';
+                        else
+                            [lookPt, newIdx] = pure_pursuit_lookahead(robots(i).pose, robots(i).path, robots(i).pathIdx, lookahead);
+                            robots(i).pathIdx = newIdx;
+                            robots(i).lookPoint = lookPt;
+                            [v, w] = compute_unicycle_to_point(robots(i).pose, lookPt, vMax, omegaMax);
+                            robots(i).vel = [v*cos(robots(i).pose(3)), v*sin(robots(i).pose(3))];
+                        end
                     end
-                end
-                
-            case 'WAITING'
-                robots(i).vel = [0,0];
-                if (t - robots(i).waitStartTime) > BLOCKING_TIMEOUT
-                    robots(i).state = 'MANEUVERING';
-                    if rand() < 0.5, robots(i).maneuverType = 'reverse'; else, robots(i).maneuverType = 'forward'; end
-                    robots(i).maneuverEndTime = t + MANEUVER_DURATION;
-                end
-                
-            case 'MANEUVERING'
-                if t < robots(i).maneuverEndTime
-                    if strcmp(robots(i).maneuverType, 'reverse')
-                        v_cmd = vReverse;
-                        w_cmd = 0.5 * (-1)^robots(i).id; 
-                    else
-                        v_cmd = vForwardManeuver;
-                        w_cmd = 0.5 * (-1)^robots(i).id; 
-                    end
-                    robots(i).vel = [v_cmd*cos(robots(i).pose(3)), v_cmd*sin(robots(i).pose(3))];
-                    robots(i).pose(3) = wrapToPi(robots(i).pose(3) + w_cmd*dt);
-                else
+    
+                case 'WAITING'
                     robots(i).vel = [0,0];
-                    robots(i).state = 'PLANNING';
+                    if (t - robots(i).waitStartTime) > BLOCKING_TIMEOUT
+                        robots(i).state = 'MANEUVERING';
+                        if rand() < 0.5, robots(i).maneuverType = 'reverse'; else, robots(i).maneuverType = 'forward'; end
+                        robots(i).maneuverEndTime = t + MANEUVER_DURATION;
+                    end
+    
+                case 'MANEUVERING'
+                    if t < robots(i).maneuverEndTime
+                        if strcmp(robots(i).maneuverType, 'reverse')
+                            v_cmd = vReverse;
+                            w_cmd = 0.5 * (-1)^robots(i).id;
+                        else
+                            v_cmd = vForwardManeuver;
+                            w_cmd = 0.5 * (-1)^robots(i).id;
+                        end
+                        robots(i).vel = [v_cmd*cos(robots(i).pose(3)), v_cmd*sin(robots(i).pose(3))];
+                        robots(i).pose(3) = wrapToPi(robots(i).pose(3) + w_cmd*dt);
+                    else
+                        robots(i).vel = [0,0];
+                        robots(i).state = 'PLANNING';
+                    end
+    
+                case 'DONE'
+                    robots(i).vel = [0,0];
+            end
+    
+            if ~strcmp(robots(i).state, 'MANEUVERING')
+                robots(i).pose(1) = robots(i).pose(1) + robots(i).vel(1)*dt;
+                robots(i).pose(2) = robots(i).pose(2) + robots(i).vel(2)*dt;
+                if norm(robots(i).vel) > 0.001
+                    targetHeading = atan2(robots(i).vel(2), robots(i).vel(1));
+                    diff = wrapToPi(targetHeading - robots(i).pose(3));
+                    rotationStep = max(min(diff, omegaMax*dt), -omegaMax*dt);
+                    robots(i).pose(3) = wrapToPi(robots(i).pose(3) + rotationStep);
                 end
-                
-            case 'DONE'
-                robots(i).vel = [0,0];
-        end
-        
-        if ~strcmp(robots(i).state, 'MANEUVERING')
-            robots(i).pose(1) = robots(i).pose(1) + robots(i).vel(1)*dt;
-            robots(i).pose(2) = robots(i).pose(2) + robots(i).vel(2)*dt;
-            if norm(robots(i).vel) > 0.001
-                 targetHeading = atan2(robots(i).vel(2), robots(i).vel(1));
-                 diff = wrapToPi(targetHeading - robots(i).pose(3));
-                 rotationStep = max(min(diff, omegaMax*dt), -omegaMax*dt);
-                 robots(i).pose(3) = wrapToPi(robots(i).pose(3) + rotationStep);
             end
         end
-    end
     
-    % --- 2. Visualization Update ---
-    for i=1:numRobots
-        x = robots(i).pose(1); y = robots(i).pose(2); th = robots(i).pose(3);
-        R = [cos(th), -sin(th); sin(th), cos(th)];
-        
-        corners = [-robotLength/2, -robotWidth/2; robotLength/2, -robotWidth/2; robotLength/2, robotWidth/2; -robotLength/2, robotWidth/2]';
-        worldCorners = R * corners + [x; y];
-        set(hBody(i), 'XData', worldCorners(1,:), 'YData', worldCorners(2,:));
-        
-        if ~isempty(robots(i).path)
-            set(hPath(i), 'XData', robots(i).path(:,1), 'YData', robots(i).path(:,2));
+        % --- 2. Visualization Update ---
+        for i=1:numRobots
+            x = robots(i).pose(1); y = robots(i).pose(2); th = robots(i).pose(3);
+            R = [cos(th), -sin(th); sin(th), cos(th)];
+    
+            corners = [-robotLength/2, -robotWidth/2; robotLength/2, -robotWidth/2; robotLength/2, robotWidth/2; -robotLength/2, robotWidth/2]';
+            worldCorners = R * corners + [x; y];
+            set(hBody(i), 'XData', worldCorners(1,:), 'YData', worldCorners(2,:));
+    
+            if ~isempty(robots(i).path)
+                set(hPath(i), 'XData', robots(i).path(:,1), 'YData', robots(i).path(:,2));
+            end
+    
+            if strcmp(robots(i).state, 'MOVING')
+                set(hLookahead(i), 'XData', robots(i).lookPoint(1), 'YData', robots(i).lookPoint(2));
+            else
+                set(hLookahead(i), 'XData', nan, 'YData', nan);
+            end
+    
+            if strcmp(robots(i).state, 'DONE')
+                set(hBody(i), 'FaceColor', [0 1 0], 'EdgeColor', 'k', 'LineWidth', 2);
+                set(hTextRobot(i), 'String', 'GOAL!', 'Color', 'k');
+                set(hGoal(i), 'Color', [0.8 0.8 0.8]);
+                set(hTrap(i), 'XData', [], 'YData', []);
+            else
+                trapPoly = trapezoid_in_front(robots(i).pose, viewDepth, viewWidthBack, viewWidthFront);
+                set(hTrap(i), 'XData', trapPoly(:,1), 'YData', trapPoly(:,2));
+                set(hTextRobot(i), 'Position', [x, y, 0]);
+            end
         end
-        
-        if strcmp(robots(i).state, 'MOVING')
-            set(hLookahead(i), 'XData', robots(i).lookPoint(1), 'YData', robots(i).lookPoint(2));
-        else
-            set(hLookahead(i), 'XData', nan, 'YData', nan);
-        end
-        
-        if strcmp(robots(i).state, 'DONE')
-            set(hBody(i), 'FaceColor', [0 1 0], 'EdgeColor', 'k', 'LineWidth', 2);
-            set(hTextRobot(i), 'String', 'GOAL!', 'Color', 'k');
-            set(hGoal(i), 'Color', [0.8 0.8 0.8]); 
-            set(hTrap(i), 'XData', [], 'YData', []);
-        else
-            trapPoly = trapezoid_in_front(robots(i).pose, viewDepth, viewWidthBack, viewWidthFront);
-            set(hTrap(i), 'XData', trapPoly(:,1), 'YData', trapPoly(:,2));
-            set(hTextRobot(i), 'Position', [x, y, 0]);
-        end
-    end
-    drawnow;
-    pause(dt); 
-    t = t + dt;
+        drawnow;
+        pause(dt);
+        t = t + dt;
 end
 fprintf('Simulation finished.\n');
-    % ... Helpers ...
+% ... Helpers ...
     function [rc] = worldToGridRC(pt, gs, ox, oy)
         rc = [round((pt(2)-oy)/gs)+1, round((pt(1)-ox)/gs)+1];
     end
     function rc = clampRC(rc, nR, nC)
         rc = max([1 1], min(rc, [nR nC]));
     end
-    
+
     function occ2 = inflate_occupancy_with_rectangle(occ_in, cx, cy, rect_w, rect_h, gs, ox, oy)
         occ2 = occ_in;
         minx = cx - rect_w/2;  maxx = cx + rect_w/2;
@@ -326,11 +331,11 @@ fprintf('Simulation finished.\n');
         r1 = max(1, floor((miny - oy)/gs) + 1);
         r2 = min(size(occ2,1), ceil((maxy - oy)/gs) + 1);
         for rr = r1:r2, for cc = c1:c2
-            cxCell = ox + (cc-1)*gs + gs/2;
-            cyCell = oy + (rr-1)*gs + gs/2;
-            if abs(cxCell - cx) <= rect_w/2 && abs(cyCell - cy) <= rect_h/2
-                occ2(rr,cc) = 1;
-            end
+                cxCell = ox + (cc-1)*gs + gs/2;
+                cyCell = oy + (rr-1)*gs + gs/2;
+                if abs(cxCell - cx) <= rect_w/2 && abs(cyCell - cy) <= rect_h/2
+                    occ2(rr,cc) = 1;
+                end
         end, end
     end
     function tri = trapezoid_in_front(pose, depth, wback, wfront)
@@ -350,7 +355,7 @@ fprintf('Simulation finished.\n');
         v=max(min(0.8*hypot(dx,dy), vMaxL), -vMaxL); w=max(min(2.0*err, wMaxL), -wMaxL);
         if abs(err)>pi/3, v=v*(1-abs(err)/pi); end
     end
-    
+
     function densePath = densify_path(pts, resolution)
         if size(pts,1) < 2, densePath=pts; return; end
         densePath = pts(1,:);
@@ -367,7 +372,7 @@ fprintf('Simulation finished.\n');
             end
         end
     end
-    
+
     function path = simplify_path_line_of_sight(pts, occ_map, gs, ox, oy)
         if size(pts,1)<=2, path=pts; return; end
         path = pts(1,:); currIdx = 1;
@@ -380,15 +385,14 @@ fprintf('Simulation finished.\n');
             end
         end
     end
-    
+
     function safe = is_line_safe(p1, p2, occ_map, gs, ox, oy)
         safe = true; dist = norm(p2-p1); if dist < 0.01, return; end
-        steps = ceil(dist / (gs/3)); 
+        steps = ceil(dist / (gs/3));
         for s = 0:steps
             pt = p1 + (p2-p1)*(s/steps); rc = worldToGridRC(pt, gs, ox, oy);
-            % CHANGED: Strict bound checking instead of clamp
             if rc(1) < 1 || rc(1) > size(occ_map,1) || rc(2) < 1 || rc(2) > size(occ_map,2)
-                safe = false; return; 
+                safe = false; return;
             end
             if occ_map(rc(1), rc(2)) == 1, safe = false; return; end
         end
